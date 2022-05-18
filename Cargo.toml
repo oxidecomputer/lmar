@@ -1,9 +1,11 @@
 [package]
-name = "pcie-poke"
+name = "lmar"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 bytes = "1.1.0"
+chrono = "0.4.19"
+clap = { version = "3.1.18", features = [ "derive" ] }
 libc = "0.2.122"
 thiserror = "1.0.30"
