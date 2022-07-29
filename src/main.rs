@@ -39,6 +39,8 @@ enum Port {
 /// parameters, and is a useful tool for diagnosing signal integrity problems.
 struct Args {
     /// The bus/device/function to run the protocol against.
+    ///
+    /// Note that values are provided in hexadecimal.
     bdf: Bdf,
 
     /// Which port to use on the chosen PCIe endpoint.
@@ -82,6 +84,9 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
 
+    #[error("Invalid PCIe read encountered")]
+    InvalidPcieRead,
+
     #[error("Invalid value for a PCIe configuration parameter '{parameter}': {value}")]
     InvalidPcieParameter { parameter: &'static str, value: u64 },
 
@@ -111,7 +116,13 @@ pub enum Error {
 const PCITOOL_IOC: i32 = (('P' as i32) << 24) | (('C' as i32) << 16) | (('T' as i32) << 8);
 const PCITOOL_DEVICE_GET_REG: i32 = PCITOOL_IOC | 1;
 const PCITOOL_DEVICE_SET_REG: i32 = PCITOOL_IOC | 2;
+
+// TODO-correctness: The register file should not matter so much, since x86 will
+// ultimately look up the device just by the BDF. But we should still do the
+// right thing eventually and map the requested BDF to the right illumos
+// register devices file.
 const PCI_REG_DEVICE_FILE: &str = "/devices/pci@0,0:reg";
+
 #[cfg(target_endian = "little")]
 const PCI_ATTR_ENDIANNESS: u32 = 0x0;
 #[cfg(not(target_endian = "little"))]
@@ -1384,7 +1395,7 @@ impl LaneMargin {
         self.inner.margin_at(cmd, duration)
     }
 
-    pub fn iter_left_right_steps(&self) -> (usize, Box<dyn Iterator<Item = StepLeftRight>>) {
+    pub fn iter_left_right_steps(&self) -> Vec<StepLeftRight> {
         let steps = self.limits().num_timing_steps;
         let base = 1..=steps;
         let right = base.clone().map(|pt| StepLeftRight {
@@ -1392,23 +1403,19 @@ impl LaneMargin {
             steps: Steps::from(pt),
         });
         if self.capabilities().independent_left_right_sampling {
-            (
-                base.len() * 2,
-                Box::new(
-                    base.rev()
-                        .map(|pt| StepLeftRight {
-                            direction: Some(LeftRight::Left),
-                            steps: Steps::from(pt),
-                        })
-                        .chain(right),
-                ),
-            )
+            base.rev()
+                .map(|pt| StepLeftRight {
+                    direction: Some(LeftRight::Left),
+                    steps: Steps::from(pt),
+                })
+                .chain(right)
+                .collect()
         } else {
-            (base.len(), Box::new(right.into_iter()))
+            right.collect()
         }
     }
 
-    pub fn iter_up_down_steps(&self) -> (usize, Box<dyn Iterator<Item = StepUpDown>>) {
+    pub fn iter_up_down_steps(&self) -> Vec<StepUpDown> {
         let steps = self.limits().num_voltage_steps;
         let base = 1..=steps;
         let up = base.clone().map(|pt| StepUpDown {
@@ -1416,19 +1423,16 @@ impl LaneMargin {
             steps: Steps::from(pt),
         });
         if self.capabilities().independent_up_down_voltage {
-            (
-                base.len() * 2,
-                Box::new(
-                    base.rev()
-                        .map(|pt| StepUpDown {
-                            direction: Some(UpDown::Down),
-                            steps: Steps::from(pt),
-                        })
-                        .chain(up),
-                ),
-            )
+            base.rev()
+                .map(|pt| StepUpDown {
+                    direction: Some(UpDown::Down),
+                    steps: Steps::from(pt),
+                })
+                .into_iter()
+                .chain(up)
+                .collect()
         } else {
-            (base.len(), Box::new(up.into_iter()))
+            up.collect()
         }
     }
 }
@@ -1447,19 +1451,15 @@ impl std::str::FromStr for Bdf {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts = s.splitn(3, '/').collect::<Vec<_>>();
         if parts.len() == 3 {
-            let bus = parts[0]
-                .parse()
-                .map_err(|_| Error::InvalidBdf(s.to_string()))?;
-            let device = parts[1]
-                .parse()
-                .map_err(|_| Error::InvalidBdf(s.to_string()))?;
-            let function = parts[2]
-                .parse()
+            let converted = parts
+                .iter()
+                .map(|part| u8::from_str_radix(part, 16))
+                .collect::<Result<Vec<u8>, _>>()
                 .map_err(|_| Error::InvalidBdf(s.to_string()))?;
             Ok(Bdf {
-                bus,
-                device,
-                function,
+                bus: converted[0],
+                device: converted[1],
+                function: converted[2],
             })
         } else {
             Err(Error::InvalidBdf(s.to_string()))
@@ -1485,10 +1485,11 @@ impl From<Bar> for u8 {
 }
 
 /// Trait used to read fixed-size words from a `Bdf`.
-pub trait DataWord: Sized + Copy + std::fmt::LowerHex {
+pub trait DataWord: Sized + Copy + std::fmt::LowerHex + PartialEq {
     fn size_attribute() -> u32;
     fn from_raw(_: u64) -> Self;
     fn to_raw(self) -> u64;
+    fn invalid_word() -> Self;
 }
 
 impl DataWord for u8 {
@@ -1502,6 +1503,10 @@ impl DataWord for u8 {
 
     fn to_raw(self) -> u64 {
         self as _
+    }
+
+    fn invalid_word() -> Self {
+        !0
     }
 }
 
@@ -1517,6 +1522,10 @@ impl DataWord for u16 {
     fn to_raw(self) -> u64 {
         self as _
     }
+
+    fn invalid_word() -> Self {
+        !0
+    }
 }
 
 impl DataWord for u32 {
@@ -1531,6 +1540,10 @@ impl DataWord for u32 {
     fn to_raw(self) -> u64 {
         self as _
     }
+
+    fn invalid_word() -> Self {
+        !0
+    }
 }
 
 impl DataWord for u64 {
@@ -1544,6 +1557,10 @@ impl DataWord for u64 {
 
     fn to_raw(self) -> u64 {
         self as _
+    }
+
+    fn invalid_word() -> Self {
+        !0
     }
 }
 
@@ -1757,7 +1774,13 @@ where
         )
     };
     if ret == 0 {
-        Ok(W::from_raw(register.data))
+        let data = W::from_raw(register.data);
+        if data == W::invalid_word() {
+            println!("data: {data:#x}");
+            Err(Error::InvalidPcieRead)
+        } else {
+            Ok(data)
+        }
     } else {
         Err(io::Error::last_os_error().into())
     }
@@ -1845,7 +1868,7 @@ fn main() {
 
     let filename = args.output.unwrap_or_else(|| {
         format!(
-            "margin-results-b{}-d{}-f{}-{}.txt",
+            "margin-results-b{:x}-d{:x}-f{:x}-{}.txt",
             args.bdf.bus,
             args.bdf.device,
             args.bdf.function,
@@ -1862,17 +1885,34 @@ fn main() {
         println!("Writing results to: \"{}\"", filename);
     }
 
-    let mut left_right: Vec<(StepLeftRight, Duration, MarginResult)> = vec![];
-    let (n_steps, iter) = margin.iter_left_right_steps();
-    for (i, step) in iter.enumerate() {
+    let timing_resolution: f64 =
+        f64::from(limits.max_timing_offset) / f64::from(limits.num_timing_steps);
+    let voltage_resolution: f64 =
+        (f64::from(limits.max_voltage_offset) / f64::from(limits.num_voltage_steps)) / 100.0;
+    writeln!(
+        outfile,
+        "Time (%UI)\tVoltage (V)\tDuration (s)\tCount\tPass"
+    )
+    .unwrap();
+
+    let steps = margin.iter_left_right_steps();
+    let n_steps = steps.len();
+    let mut left_right: Vec<(StepLeftRight, Duration, MarginResult)> = Vec::with_capacity(steps.len());
+    for (i, step) in steps.into_iter().enumerate() {
         margin.clear_error_log().unwrap();
         margin.go_to_normal_settings().unwrap();
         margin.no_command().unwrap();
-        let (margin_duration, result) = margin.margin_at_left_right(step, duration).unwrap();
+        let (margin_duration, result) = match margin.margin_at_left_right(step, duration) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("Failed to margin point: {step:?}: {e}");
+                std::process::exit(1);
+            }
+        };
         left_right.push((step, margin_duration, result));
         if args.verbose > 1 {
             println!(
-                "{}/{n_steps}: {step:?}, Duration: {duration:?}, {result:?}",
+                "{}/{n_steps}: {step:?}, Duration: {margin_duration:?}, {result:?}",
                 i + 1
             );
         } else if args.verbose == 1 {
@@ -1883,54 +1923,15 @@ fn main() {
                 println!("\rMargining time: {}/{n_steps}", i + 1);
             }
         }
-    }
-    if args.verbose == 1 {
-        println!("");
-    }
 
-    let mut up_down: Vec<(StepUpDown, Duration, MarginResult)> = vec![];
-    let (n_steps, iter) = margin.iter_up_down_steps();
-    for (i, step) in iter.enumerate() {
-        margin.clear_error_log().unwrap();
-        margin.go_to_normal_settings().unwrap();
-        margin.no_command().unwrap();
-
-        let (margin_duration, result) = margin.margin_at_up_down(step, duration).unwrap();
-        up_down.push((step, margin_duration, result));
-        if args.verbose > 1 {
-            println!(
-                "{}/{n_steps}: {step:?}, Duration: {duration:?}, {result:?}",
-                i + 1
-            );
-        } else if args.verbose > 0 {
-            if i < n_steps - 1 {
-                print!("\rMargining voltage: {}/{n_steps}", i + 1);
-                std::io::stdout().flush().unwrap();
-            } else {
-                println!("\rMargining voltage: {}/{n_steps}", i + 1);
-            }
-        }
-    }
-
-    let timing_resolution: f64 =
-        f64::from(limits.max_timing_offset) / f64::from(limits.num_timing_steps);
-    let voltage_resolution: f64 =
-        (f64::from(limits.max_voltage_offset) / f64::from(limits.num_voltage_steps)) / 100.0;
-
-    writeln!(
-        outfile,
-        "Time (%UI)\tVoltage (V)\tDuration (s)\tCount\tPass"
-    )
-    .unwrap();
-    for (step, margin_duration, result) in left_right.iter() {
         let sign = if matches!(step.direction, Some(LeftRight::Left)) {
             -1.0
         } else {
             1.0
         };
         let (pass, count) = match result {
-            MarginResult::Success(count) => (1, u8::from(*count)),
-            MarginResult::Failed(count) => (0, u8::from(*count)),
+            MarginResult::Success(count) => (1, u8::from(count)),
+            MarginResult::Failed(count) => (0, u8::from(count)),
         };
         writeln!(
             outfile,
@@ -1941,17 +1942,50 @@ fn main() {
             pass,
         )
         .unwrap();
+
+    }
+    if args.verbose == 1 {
+        println!("");
     }
 
-    for (step, margin_duration, result) in up_down.iter() {
+    let steps = margin.iter_up_down_steps();
+    let n_steps = steps.len();
+    let mut up_down: Vec<(StepUpDown, Duration, MarginResult)> = Vec::with_capacity(steps.len());
+    for (i, step) in steps.into_iter().enumerate() {
+        margin.clear_error_log().unwrap();
+        margin.go_to_normal_settings().unwrap();
+        margin.no_command().unwrap();
+
+        let (margin_duration, result) = match margin.margin_at_up_down(step, duration) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("Failed to margin point: {step:?}: {e}");
+                std::process::exit(1);
+            }
+        };
+        up_down.push((step, margin_duration, result));
+        if args.verbose > 1 {
+            println!(
+                "{}/{n_steps}: {step:?}, Duration: {margin_duration:?}, {result:?}",
+                i + 1
+            );
+        } else if args.verbose > 0 {
+            if i < n_steps - 1 {
+                print!("\rMargining voltage: {}/{n_steps}", i + 1);
+                std::io::stdout().flush().unwrap();
+            } else {
+                println!("\rMargining voltage: {}/{n_steps}", i + 1);
+            }
+        }
+
         let sign = if matches!(step.direction, Some(UpDown::Down)) {
             -1.0
         } else {
             1.0
         };
         let (pass, count) = match result {
-            MarginResult::Success(count) => (1, u8::from(*count)),
-            MarginResult::Failed(count) => (0, u8::from(*count)),
+            MarginResult::Success(count) => (1, u8::from(count)),
+            MarginResult::Failed(count) => (0, u8::from(count)),
         };
         writeln!(
             outfile,
