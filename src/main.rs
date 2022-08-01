@@ -1112,54 +1112,85 @@ impl LaneMarginInner {
     }
 
     fn gather_limits(&self) -> Result<MarginingLimits, Error> {
-        let num_voltage_steps = if let ReportResponse::NumVoltageSteps(steps) =
-            self.report(ReportRequest::NumVoltageSteps)?
-        {
-            steps
+        let caps = self.report_capabilities()?;
+        let num_voltage_steps = if caps.voltage_supported {
+            match self.report(ReportRequest::NumVoltageSteps)? {
+                ReportResponse::NumVoltageSteps(steps) => Some(steps),
+                other => {
+                    return Err(Error::Margin(format!(
+                        "Unexpected response requesting NumVoltageSteps: {:?}",
+                        other
+                    )));
+                }
+            }
         } else {
-            101
+            None
         };
         self.no_command()?;
-        let num_timing_steps = if let ReportResponse::NumTimingSteps(steps) =
-            self.report(ReportRequest::NumTimingSteps)?
-        {
-            steps
-        } else {
-            101
+
+        let num_timing_steps = match self.report(ReportRequest::NumTimingSteps)? {
+            ReportResponse::NumTimingSteps(steps) => steps,
+            other => {
+                return Err(Error::Margin(format!(
+                    "Unexpected response requesting NumTimingSteps: {:?}",
+                    other
+                )));
+            }
         };
         self.no_command()?;
-        let max_timing_offset = if let ReportResponse::MaxTimingOffset(steps) =
-            self.report(ReportRequest::MaxTimingOffset)?
-        {
-            steps
-        } else {
-            101
+
+        let max_timing_offset = match self.report(ReportRequest::MaxTimingOffset)? {
+            ReportResponse::MaxTimingOffset(offset) => offset,
+            other => {
+                return Err(Error::Margin(format!(
+                    "Unexpected response requesting MaxTimingOffset: {:?}",
+                    other
+                )));
+            }
         };
         self.no_command()?;
-        let max_voltage_offset = if let ReportResponse::MaxVoltageOffset(steps) =
-            self.report(ReportRequest::MaxVoltageOffset)?
-        {
-            steps
+
+        let max_voltage_offset = if caps.voltage_supported {
+            match self.report(ReportRequest::MaxVoltageOffset)? {
+                ReportResponse::MaxVoltageOffset(offset) => Some(offset),
+                other => {
+                    return Err(Error::Margin(format!(
+                        "Unexpected response requesting MaxVoltageOffset: {:?}",
+                        other
+                    )));
+                }
+            }
         } else {
-            101
+            None
         };
         self.no_command()?;
-        let sampling_rate_voltage = if let ReportResponse::SamplingRateVoltage(steps) =
-            self.report(ReportRequest::SamplingRateVoltage)?
-        {
-            steps
+
+        let sampling_rate_voltage = if caps.voltage_supported {
+            match self.report(ReportRequest::SamplingRateVoltage)? {
+                ReportResponse::SamplingRateVoltage(rate) => Some(rate),
+                other => {
+                    return Err(Error::Margin(format!(
+                        "Unexpected response requesting SamplingRateVoltage: {:?}",
+                        other
+                    )));
+                }
+            }
         } else {
-            101
+            None
         };
         self.no_command()?;
-        let sampling_rate_timing = if let ReportResponse::SamplingRateTiming(steps) =
-            self.report(ReportRequest::SamplingRateTiming)?
-        {
-            steps
-        } else {
-            101
+
+        let sampling_rate_timing = match self.report(ReportRequest::SamplingRateTiming)? {
+            ReportResponse::SamplingRateTiming(rate) => rate,
+            other => {
+                return Err(Error::Margin(format!(
+                    "Unexpected response requesting SamplingRateTiming: {:?}",
+                    other
+                )));
+            }
         };
         self.no_command()?;
+
         Ok(MarginingLimits {
             num_voltage_steps,
             num_timing_steps,
@@ -1276,11 +1307,12 @@ impl LaneMarginInner {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MarginingLimits {
-    pub num_voltage_steps: u8,
+    // None if not supported
+    pub num_voltage_steps: Option<u8>,
     pub num_timing_steps: u8,
     pub max_timing_offset: u8,
-    pub max_voltage_offset: u8,
-    pub sampling_rate_voltage: u8,
+    pub max_voltage_offset: Option<u8>,
+    pub sampling_rate_voltage: Option<u8>,
     pub sampling_rate_timing: u8,
 }
 
@@ -1357,6 +1389,10 @@ impl LaneMargin {
         &self.capabilities
     }
 
+    pub fn supports_voltage_margining(&self) -> bool {
+        self.limits.num_voltage_steps.is_some()
+    }
+
     pub fn limits(&self) -> &MarginingLimits {
         &self.limits
     }
@@ -1416,23 +1452,27 @@ impl LaneMargin {
     }
 
     pub fn iter_up_down_steps(&self) -> Vec<StepUpDown> {
-        let steps = self.limits().num_voltage_steps;
-        let base = 1..=steps;
-        let up = base.clone().map(|pt| StepUpDown {
-            direction: Some(UpDown::Up),
-            steps: Steps::from(pt),
-        });
-        if self.capabilities().independent_up_down_voltage {
-            base.rev()
-                .map(|pt| StepUpDown {
-                    direction: Some(UpDown::Down),
+        match self.limits().num_voltage_steps {
+            None => vec![],
+            Some(steps) => {
+                let base = 1..=steps;
+                let up = base.clone().map(|pt| StepUpDown {
+                    direction: Some(UpDown::Up),
                     steps: Steps::from(pt),
-                })
-                .into_iter()
-                .chain(up)
-                .collect()
-        } else {
-            up.collect()
+                });
+                if self.capabilities().independent_up_down_voltage {
+                    base.rev()
+                        .map(|pt| StepUpDown {
+                            direction: Some(UpDown::Down),
+                            steps: Steps::from(pt),
+                        })
+                        .into_iter()
+                        .chain(up)
+                        .collect()
+                } else {
+                    up.collect()
+                }
+            }
         }
     }
 }
@@ -1887,8 +1927,11 @@ fn main() {
 
     let timing_resolution: f64 =
         f64::from(limits.max_timing_offset) / f64::from(limits.num_timing_steps);
-    let voltage_resolution: f64 =
-        (f64::from(limits.max_voltage_offset) / f64::from(limits.num_voltage_steps)) / 100.0;
+    let voltage_resolution: f64 = if caps.voltage_supported {
+        (f64::from(limits.max_voltage_offset.unwrap()) / f64::from(limits.num_voltage_steps.unwrap())) / 100.0
+    } else {
+        0.0
+    };
     writeln!(
         outfile,
         "Time (%UI)\tVoltage (V)\tDuration (s)\tCount\tPass"
