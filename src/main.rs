@@ -84,8 +84,8 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
 
-    #[error("Invalid PCIe read encountered")]
-    InvalidPcieRead,
+    #[error("Invalid PCIe read encountered: offset {0}, data: {1}")]
+    InvalidPcieRead(usize, u64),
 
     #[error("Invalid value for a PCIe configuration parameter '{parameter}': {value}")]
     InvalidPcieParameter { parameter: &'static str, value: u64 },
@@ -769,7 +769,7 @@ impl From<StepUpDown> for u8 {
     fn from(step: StepUpDown) -> u8 {
         let bits = match step.direction {
             None => 0b0,
-            Some(dir) => u8::from(dir) << 6,
+            Some(dir) => u8::from(dir) << 7,
         };
         bits | u8::from(step.steps)
     }
@@ -795,7 +795,7 @@ pub struct Steps(u8);
 
 impl From<u8> for Steps {
     fn from(word: u8) -> Steps {
-        Self(word & 0b1111111)
+        Self(word & 0b01111111)
     }
 }
 
@@ -1367,6 +1367,14 @@ impl LaneMargin {
         })
     }
 
+    pub fn vendor_id(&self) -> u16 {
+        self.inner.device.vendor_id
+    }
+
+    pub fn device_id(&self) -> u16 {
+        self.inner.device.device_id
+    }
+
     /// Consume the lane margin controller, and return the device. This is
     /// useful for running the margining protocol on a new lane or receiver.
     pub fn device(self) -> PcieDevice {
@@ -1816,8 +1824,7 @@ where
     if ret == 0 {
         let data = W::from_raw(register.data);
         if data == W::invalid_word() {
-            println!("data: {data:#x}");
-            Err(Error::InvalidPcieRead)
+            Err(Error::InvalidPcieRead(offset, register.data))
         } else {
             Ok(data)
         }
@@ -1860,6 +1867,28 @@ where
 pub enum MarginResult {
     Success(ErrorCount),
     Failed(ErrorCount),
+}
+
+fn write_file_header(outfile: &mut File, margin: &LaneMargin) -> std::io::Result<()> {
+    writeln!(
+        outfile,
+        "Vendor ID: {:#x}",
+        margin.vendor_id(),
+    )?;
+    writeln!(
+        outfile,
+        "Device ID: {:#x}",
+        margin.device_id(),
+    )?;
+    writeln!(
+        outfile,
+        "Lane: {}",
+        margin.lane(),
+    )?;
+    writeln!(
+        outfile,
+        "Time (%UI)\tVoltage (V)\tDuration (s)\tCount\tPass"
+    )
 }
 
 fn main() {
@@ -1908,10 +1937,11 @@ fn main() {
 
     let filename = args.output.unwrap_or_else(|| {
         format!(
-            "margin-results-b{:x}-d{:x}-f{:x}-{}.txt",
+            "margin-results-b{:x}-d{:x}-f{:x}-l{}-{}.txt",
             args.bdf.bus,
             args.bdf.device,
             args.bdf.function,
+            args.lane,
             chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S"),
         )
     });
@@ -1932,11 +1962,7 @@ fn main() {
     } else {
         0.0
     };
-    writeln!(
-        outfile,
-        "Time (%UI)\tVoltage (V)\tDuration (s)\tCount\tPass"
-    )
-    .unwrap();
+    write_file_header(&mut outfile, &margin).unwrap();
 
     let steps = margin.iter_left_right_steps();
     let n_steps = steps.len();
