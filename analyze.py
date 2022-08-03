@@ -1,10 +1,46 @@
 #!/usr/bin/env python3
+"""lmar.py
+Analyize lane margining results
+Copyright 2022 Oxide Computer Company
+"""
 
+from tabulate import tabulate
 from argparse import ArgumentParser
 import os.path
 import numpy as np
 import matplotlib.pyplot as plt
 import sys
+
+
+def compute_margin(results, key) -> float:
+    passed = results["passed"]
+    independent_axis = results[key]
+
+    # First, handle the cases when there are no passes or no failures
+    n_passes = np.sum(passed)
+    if n_passes == 0:
+        return 0.0
+    if n_passes == len(passed):
+        return independent_axis.ptp()
+
+    # Try to compute the last - first point at which the margining
+    # passed. If there are exactly two such points, then we're done.
+    passed_indices = np.where(np.diff(passed))[0]
+    if len(passed_indices) == 2:
+        return independent_axis[passed_indices[1]] - independent_axis[passed_indices[0]]
+
+    # If there are more than 2 such indices, then take the longest
+    # run, i.e., the ones with the largest difference
+    if len(passed_indices) > 2:
+        run_length = np.diff(passed_indices)
+        max_run = np.argmax(run_length)
+        return (
+            independent_axis[passed_indices[max_run + 1]]
+            - independent_axis[passed_indices[max_run]]
+        )
+
+    # Not sure, hunk a nan in there
+    return np.nan
 
 
 def load_results(file: str) -> dict[dict]:
@@ -47,10 +83,7 @@ def plot_results(ax, key, results):
     """Plot the results on an axis"""
     passed = results["passed"]
     independent_axis_passed = results[key][passed]
-    # TODO-correctness: Peak-to-peak isn't quite right.
-    # We probably want the longest uninterrupted / contiguous run
-    # of passes.
-    margin = independent_axis_passed.ptp()
+    margin = compute_margin(results, key)
     failed = np.logical_not(passed)
     ax.plot(
         independent_axis_passed,
@@ -92,19 +125,32 @@ def format_plot(results, fig, axes):
     )
 
 
-if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument(
-        "-s",
-        "--save",
-        help="Save each plot, rather than displaying",
-        action="store_true",
+def summarize(namespace):
+    files = namespace.files
+    table = dict(vendor_id=[], device_id=[], lane=[], time_margin=[], voltage_margin=[])
+    for file in files:
+        results = load_results(file)
+        table["vendor_id"].append("0x{:04x}".format(results["vendor_id"]))
+        table["device_id"].append("0x{:04x}".format(results["device_id"]))
+        table["lane"].append(results["lane"])
+        table["time_margin"].append(compute_margin(results["time"], "time"))
+        table["voltage_margin"].append(compute_margin(results["voltage"], "voltage"))
+    headers = (
+        "Vendor ID",
+        "Device ID",
+        "Lane",
+        "Time margin (% UI)",
+        "Voltage margin (V)",
     )
-    parser.add_argument("files", help="Input data file(s)", nargs="+")
-    namespace = parser.parse_args(sys.argv[1:])
+    print(tabulate(table, headers=headers))
+
+
+def plot(namespace):
+    files = namespace.files
+    save = namespace.save
 
     figs = []
-    for file in namespace.files:
+    for file in files:
         results = load_results(file)
         fig, axes = plt.subplots(1, 2, sharey="row", figsize=(8, 3))
 
@@ -112,13 +158,34 @@ if __name__ == "__main__":
             plot_results(ax, key, results[key])
         format_plot(results, fig, axes)
 
-        if namespace.save:
+        if save:
             root, ext = os.path.splitext(file)
             savefile = f"{root}.pdf"
             fig.savefig(savefile)
             plt.close(fig)
         else:
             figs.append(fig)
-    if not namespace.save:
+    if not save:
         plt.ioff()
         plt.show()
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    subparsers = parser.add_subparsers()
+    plot_parser = subparsers.add_parser("plot", help="Plot margining data")
+    plot_parser.add_argument(
+        "-s",
+        "--save",
+        help="Save each plot, rather than displaying",
+        action="store_true",
+    )
+    plot_parser.add_argument("files", help="Input data file(s)", nargs="+")
+    plot_parser.set_defaults(func=plot)
+
+    summarize_parser = subparsers.add_parser("summarize", help="Print a summary table")
+    summarize_parser.add_argument("files", help="Input data file(s)", nargs="+")
+    summarize_parser.set_defaults(func=summarize)
+
+    namespace = parser.parse_args(sys.argv[1:])
+    namespace.func(namespace)
