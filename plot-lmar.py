@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from argparse import ArgumentParser
+import os.path
 import numpy as np
 import matplotlib.pyplot as plt
 import sys
@@ -10,7 +12,11 @@ def load_results(file: str) -> dict[dict]:
 
     Returns a dict with the results for left and right separately.
     """
-    results = np.loadtxt(file, skiprows=1, delimiter="\t")
+    with open(file, "rb") as f:
+        vendor_id = int(f.readline().rstrip().rsplit()[-1], base=16)
+        device_id = int(f.readline().rstrip().rsplit()[-1], base=16)
+        lane = int(f.readline().rstrip().rsplit()[-1])
+    results = np.loadtxt(file, skiprows=4, delimiter="\t")
     (time, voltage, duration, count, passed) = range(5)
     is_time = results[:, time] != 0
     is_voltage = np.logical_not(is_time)
@@ -28,15 +34,26 @@ def load_results(file: str) -> dict[dict]:
         passed=results[is_voltage, passed].astype(np.bool),
         xlabel="Voltage (V)",
     )
-    return dict(time=time_results, voltage=voltage_results)
+    return dict(
+        vendor_id=vendor_id,
+        device_id=device_id,
+        lane=lane,
+        time=time_results,
+        voltage=voltage_results,
+    )
 
 
 def plot_results(ax, key, results):
     """Plot the results on an axis"""
     passed = results["passed"]
+    independent_axis_passed = results[key][passed]
+    # TODO-correctness: Peak-to-peak isn't quite right.
+    # We probably want the longest uninterrupted / contiguous run
+    # of passes.
+    margin = independent_axis_passed.ptp()
     failed = np.logical_not(passed)
     ax.plot(
-        results[key][passed],
+        independent_axis_passed,
         results["count"][passed],
         marker="o",
         color="g",
@@ -52,32 +69,56 @@ def plot_results(ax, key, results):
         linestyle="none",
     )
     ax.set_xlabel(results["xlabel"])
+    ax.set_title(f"Margin: {margin:.03}", fontsize=14)
     for tick in (*ax.get_xticklabels(), *ax.get_yticklabels()):
         tick.set_fontsize(12)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
 
 
-def format_plot(fig, axes):
+def format_plot(results, fig, axes):
     axes[0].set_ylabel("Count")
     leg = axes[0].legend(
         ("Success", "Fail"), title="Margin result", fontsize=10, title_fontsize=12
     )
     leg.set_draggable(True)
     fig.tight_layout()
-    plt.show()
+    fig.canvas.set_window_title(
+        "Vendor: {:x}, Device: {:x}, Lane {:d}".format(
+            results["vendor_id"],
+            results["device_id"],
+            results["lane"],
+        )
+    )
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: ./plot-lmar.py <FILE>")
-        sys.exit(1)
+    parser = ArgumentParser()
+    parser.add_argument(
+        "-s",
+        "--save",
+        help="Save each plot, rather than displaying",
+        action="store_true",
+    )
+    parser.add_argument("files", help="Input data file(s)", nargs="+")
+    namespace = parser.parse_args(sys.argv[1:])
 
-    results = load_results(sys.argv[1])
+    figs = []
+    for file in namespace.files:
+        results = load_results(file)
+        fig, axes = plt.subplots(1, 2, sharey="row", figsize=(8, 3))
 
-    plt.ioff()
-    fig, axes = plt.subplots(1, 2, sharey="row", figsize=(8, 3))
+        for ax, key in zip(axes, ("time", "voltage")):
+            plot_results(ax, key, results[key])
+        format_plot(results, fig, axes)
 
-    for ax, (key, res) in zip(axes, results.items()):
-        plot_results(ax, key, res)
-    format_plot(fig, axes)
+        if namespace.save:
+            root, ext = os.path.splitext(file)
+            savefile = f"{root}.pdf"
+            fig.savefig(savefile)
+            plt.close(fig)
+        else:
+            figs.append(fig)
+    if not namespace.save:
+        plt.ioff()
+        plt.show()
