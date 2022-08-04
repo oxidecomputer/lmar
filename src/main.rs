@@ -1766,39 +1766,6 @@ impl PcieDevice {
     }
 }
 
-/*
-struct LinkMargin {
-    device: PcieDevice,
-    limits: MarginLimits,
-}
-*/
-
-// Should always be able to issue no command
-// Should always have the ability to wait for a command success/failure
-// Should always be able to check if margining is supported
-
-/// State when we've verified that the link supports margining and is in the
-/// correct power state, the link is up, and the speed is supported.
-///
-/// From here we can go to an error or LimitsReported.
-//trait Initialized;
-
-// Here we can report limits
-
-/// State after we've reported the voltage/timing limits, the number of steps in
-/// each (if they're both supported), the sampling rate in voltage/timing steps.
-/// This basically means we know the grid of the margining process.
-///
-/// From here we can go to an error or take margin steps.
-//trait Limits;
-
-// Here we can take a step in either direction, verified to be within the limits
-// as previously learned.
-//
-// Not sure the state business is worth it. We should just check that margining
-// is supported and that we know the limits in the constructor. After that
-// we just take some steps, get the result, check if we've failed, etc.
-
 fn read_configuration_space<W>(file: &File, bdf: &Bdf, offset: usize) -> Result<W, Error>
 where
     W: DataWord,
@@ -1870,21 +1837,9 @@ pub enum MarginResult {
 }
 
 fn write_file_header(outfile: &mut File, margin: &LaneMargin) -> std::io::Result<()> {
-    writeln!(
-        outfile,
-        "Vendor ID: {:#x}",
-        margin.vendor_id(),
-    )?;
-    writeln!(
-        outfile,
-        "Device ID: {:#x}",
-        margin.device_id(),
-    )?;
-    writeln!(
-        outfile,
-        "Lane: {}",
-        margin.lane(),
-    )?;
+    writeln!(outfile, "Vendor ID: {:#x}", margin.vendor_id(),)?;
+    writeln!(outfile, "Device ID: {:#x}", margin.device_id(),)?;
+    writeln!(outfile, "Lane: {}", margin.lane(),)?;
     writeln!(
         outfile,
         "Time (%UI)\tVoltage (V)\tDuration (s)\tCount\tPass"
@@ -1958,7 +1913,9 @@ fn main() {
     let timing_resolution: f64 =
         f64::from(limits.max_timing_offset) / f64::from(limits.num_timing_steps);
     let voltage_resolution: f64 = if caps.voltage_supported {
-        (f64::from(limits.max_voltage_offset.unwrap()) / f64::from(limits.num_voltage_steps.unwrap())) / 100.0
+        (f64::from(limits.max_voltage_offset.unwrap())
+            / f64::from(limits.num_voltage_steps.unwrap()))
+            / 100.0
     } else {
         0.0
     };
@@ -1966,7 +1923,8 @@ fn main() {
 
     let steps = margin.iter_left_right_steps();
     let n_steps = steps.len();
-    let mut left_right: Vec<(StepLeftRight, Duration, MarginResult)> = Vec::with_capacity(steps.len());
+    let mut left_right: Vec<(StepLeftRight, Duration, MarginResult)> =
+        Vec::with_capacity(steps.len());
     for (i, step) in steps.into_iter().enumerate() {
         margin.clear_error_log().unwrap();
         margin.go_to_normal_settings().unwrap();
@@ -2011,7 +1969,6 @@ fn main() {
             pass,
         )
         .unwrap();
-
     }
     if args.verbose == 1 {
         println!("");
