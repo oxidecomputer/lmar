@@ -4,6 +4,7 @@
 
 //! PCIe lane margining at the receiver prototype.
 
+use anyhow::Context;
 use clap::ArgEnum;
 use clap::Parser;
 use std::collections::BTreeMap;
@@ -84,7 +85,7 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
 
-    #[error("Invalid PCIe read encountered: offset {0}, data: {1}")]
+    #[error("Invalid PCIe read encountered: offset {0:#x}, data: {1:#x}")]
     InvalidPcieRead(usize, u64),
 
     #[error("Invalid value for a PCIe configuration parameter '{parameter}': {value}")]
@@ -229,7 +230,7 @@ impl ExtendedCapability {
     /// else returns None at this point.
     pub fn data_size(&self) -> Option<usize> {
         match self.id {
-            ExtendedCapabilityId::LaneMargining => Some(0x88),
+            ExtendedCapabilityId::LaneMargining => Some(88),
             _ => None,
         }
     }
@@ -586,7 +587,7 @@ impl From<u16> for MarginCommand {
                 _ => MarginCommand::SetErrorCountLimit(ErrorCount::from(payload)),
             },
             0b011 => MarginCommand::StepLeftRight(StepLeftRight::from(payload)),
-            0b100 => MarginCommand::StepLeftRight(StepLeftRight::from(payload)),
+            0b100 => MarginCommand::StepUpDown(StepUpDown::from(payload)),
             _ => unreachable!(),
         }
     }
@@ -729,7 +730,8 @@ impl From<u8> for StepLeftRight {
     fn from(word: u8) -> StepLeftRight {
         Self {
             direction: Some(LeftRight::from(word)),
-            steps: Steps::from(word),
+            // Only bits 5:0 are valid
+            steps: Steps::from(word & 0b0011_1111),
         }
     }
 }
@@ -775,6 +777,16 @@ impl From<StepUpDown> for u8 {
     }
 }
 
+impl From<u8> for StepUpDown {
+    fn from(word: u8) -> StepUpDown {
+        Self {
+            direction: Some(UpDown::from(word)),
+            // Only bits 6:0 are valid
+            steps: Steps::from(word & 0b0111_1111),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum UpDown {
     Up,
@@ -790,12 +802,22 @@ impl From<UpDown> for u8 {
     }
 }
 
+impl From<u8> for UpDown {
+    fn from(ud: u8) -> Self {
+        match ud & 0b1000_0000 {
+            0b1000_0000 => UpDown::Down,
+            0b0000_0000 => UpDown::Up,
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Steps(u8);
 
 impl From<u8> for Steps {
     fn from(word: u8) -> Steps {
-        Self(word & 0b01111111)
+        Self(word & 0b0111_1111)
     }
 }
 
@@ -1846,11 +1868,11 @@ fn write_file_header(outfile: &mut File, margin: &LaneMargin) -> std::io::Result
     )
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let device = PcieDevice::new(args.bdf).expect("Failed to create PCIe device");
-    let link_status = device.link_status().expect("Failed to get link status");
+    let device = PcieDevice::new(args.bdf).context("Failed to create PCIe device")?;
+    let link_status = device.link_status().context("Failed to get link status")?;
 
     if args.verbose > 1 {
         println!("{:#x?}", link_status);
@@ -1861,7 +1883,7 @@ fn main() {
         Port::Downstream => Receiver::downstream(),
     };
 
-    let lane = Lane::new(args.lane).expect("Invalid lane");
+    let lane = Lane::new(args.lane).context("Invalid lane")?;
     assert!(
         link_status.valid_lane(lane),
         "Lane {} is invalid for a device with link width {}",
@@ -1870,7 +1892,7 @@ fn main() {
     );
 
     let margin =
-        LaneMargin::new(device, receiver, lane).expect("Could not initialize lane margining");
+        LaneMargin::new(device, receiver, lane).context("Could not initialize lane margining")?;
     let caps = margin.capabilities();
     let limits = margin.limits();
 
@@ -1905,7 +1927,7 @@ fn main() {
         .write(true)
         .create_new(true)
         .open(&filename)
-        .expect("Failed to create output file");
+        .context("Failed to create output file")?;
     if args.verbose > 0 {
         println!("Writing results to: \"{}\"", filename);
     }
@@ -1919,23 +1941,20 @@ fn main() {
     } else {
         0.0
     };
-    write_file_header(&mut outfile, &margin).unwrap();
+    write_file_header(&mut outfile, &margin)?;
 
     let steps = margin.iter_left_right_steps();
     let n_steps = steps.len();
     let mut left_right: Vec<(StepLeftRight, Duration, MarginResult)> =
         Vec::with_capacity(steps.len());
     for (i, step) in steps.into_iter().enumerate() {
-        margin.clear_error_log().unwrap();
-        margin.go_to_normal_settings().unwrap();
-        margin.no_command().unwrap();
-        let (margin_duration, result) = match margin.margin_at_left_right(step, duration) {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("Failed to margin point: {step:?}: {e}");
-                std::process::exit(1);
-            }
-        };
+        margin.clear_error_log()?;
+        margin.go_to_normal_settings()?;
+        margin.no_command()?;
+
+        let (margin_duration, result) = margin
+            .margin_at_left_right(step, duration)
+            .context(format!("Failed to margin point: {step:?}"))?;
         left_right.push((step, margin_duration, result));
         if args.verbose > 1 {
             println!(
@@ -1978,17 +1997,13 @@ fn main() {
     let n_steps = steps.len();
     let mut up_down: Vec<(StepUpDown, Duration, MarginResult)> = Vec::with_capacity(steps.len());
     for (i, step) in steps.into_iter().enumerate() {
-        margin.clear_error_log().unwrap();
-        margin.go_to_normal_settings().unwrap();
-        margin.no_command().unwrap();
+        margin.clear_error_log()?;
+        margin.go_to_normal_settings()?;
+        margin.no_command()?;
 
-        let (margin_duration, result) = match margin.margin_at_up_down(step, duration) {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("Failed to margin point: {step:?}: {e}");
-                std::process::exit(1);
-            }
-        };
+        let (margin_duration, result) = margin
+            .margin_at_up_down(step, duration)
+            .context(format!("Failed to margin point: {step:?}"))?;
         up_down.push((step, margin_duration, result));
         if args.verbose > 1 {
             println!(
@@ -2023,4 +2038,6 @@ fn main() {
         )
         .unwrap();
     }
+
+    Ok(())
 }
