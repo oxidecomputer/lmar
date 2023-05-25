@@ -223,19 +223,6 @@ pub struct ExtendedCapability {
     pub version: u8,
 }
 
-impl ExtendedCapability {
-    /// Return the size of the capability data blob associated with this cap ID.
-    ///
-    /// We're pretty heavily targeting the Lane Margining Cap, so everything
-    /// else returns None at this point.
-    pub fn data_size(&self) -> Option<usize> {
-        match self.id {
-            ExtendedCapabilityId::LaneMargining => Some(88),
-            _ => None,
-        }
-    }
-}
-
 impl From<u32> for ExtendedCapability {
     fn from(x: u32) -> Self {
         let id = ExtendedCapabilityId::from((x & 0x0000_FFFF) as u16);
@@ -1353,9 +1340,9 @@ impl LaneMargin {
         let n_lanes = usize::from(u8::from(link_status.width));
         // 2 u16s for each lane (control / status) + 2 for the port capability / status
         let n_bytes = (n_lanes + 1) * std::mem::size_of::<u16>() * 2;
-        let data =
-            device.read_extended_capability_data::<u8>(&ExtendedCapabilityId::LaneMargining)?;
-        let header = LaneMarginingCapabilityHeader::try_from(&data[..n_bytes])?;
+        let data = device
+            .read_extended_capability_data::<u8>(&ExtendedCapabilityId::LaneMargining, n_bytes)?;
+        let header = LaneMarginingCapabilityHeader::try_from(data.as_slice())?;
         if !header.port_status.ready {
             return Err(Error::Margin(format!(
                 "Margining appears unsupported on this device"
@@ -1762,23 +1749,22 @@ impl PcieDevice {
         )?)
     }
 
-    // Read the data associated with the requested capability, if it exists
+    // Read `len` items of data associated with the requested capability, if
+    // exists. This skips the extended capability header itself.
     pub fn read_extended_capability_data<T>(
         &self,
         id: &ExtendedCapabilityId,
+        len: usize,
     ) -> Result<Vec<T>, Error>
     where
         T: DataWord,
     {
-        let (&cap_start, cap) = self
+        let (&cap_start, _) = self
             .find_extended_capability(id)
             .ok_or_else(|| Error::UnsupportedExtendedCap(*id))?;
-        let size = cap.data_size().ok_or_else(|| {
-            Error::Unimplemented(format!("Extended capability parsing for cap: {:?}", id))
-        })?;
         let data_start = cap_start + std::mem::size_of::<u32>(); // Skip the capability header itself
-        let data_end = cap_start + size;
-        let mut data = Vec::with_capacity(data_end - data_start);
+        let data_end = data_start + len;
+        let mut data = Vec::with_capacity(len);
         for offset in data_start..data_end {
             data.push(read_configuration_space::<T>(
                 &self.file, &self.bdf, offset,
