@@ -26,6 +26,32 @@ enum Port {
     Downstream,
 }
 
+// Consts for verbosity levels
+mod verbosity {
+
+    // Print the device's link status.
+    pub const LINK_STATUS: u64 = 1;
+
+    // Print the device's capabilities and margin limits
+    pub const CAPABILITIES: u64 = 1;
+
+    // Print the margin duration
+    pub const MARGIN_DURATION: u64 = 1;
+
+    // Print the output file name for saving the results.
+    pub const FILENAME: u64 = 1;
+
+    // Print a summary of margining progress, clearing the line between each
+    // point
+    pub const PROGRESS_SUMMARY: u64 = 1;
+
+    // Print all commands in Rust debug format
+    pub const COMMANDS: u64 = 2;
+
+    // Print all command register bit fields.
+    pub const COMMAND_DETAIL: u64 = 3;
+}
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 /// The `lmar` program is a prototype tool to run the PCIe Lane Margining at the
@@ -77,6 +103,11 @@ struct Args {
     /// Print verbose information about the device and margining process.
     #[clap(short, long, parse(from_occurrences))]
     verbose: u64,
+
+    /// Only report the margining capabilities of the device, but do not
+    /// actually run the margining protocol.
+    #[clap(short, long)]
+    report_only: bool,
 }
 
 /// Errors working with a PCIe device
@@ -470,7 +501,7 @@ pub enum MarginCommand {
 
 impl MarginCommand {
     pub fn margin_type(&self) -> u8 {
-        let bits = match self {
+        match self {
             MarginCommand::NoCommand => 0b111,
             MarginCommand::Report(_) => 0b001,
             MarginCommand::SetErrorCountLimit(_)
@@ -478,8 +509,7 @@ impl MarginCommand {
             | MarginCommand::ClearErrorLog => 0b010,
             MarginCommand::StepLeftRight(_) => 0b011,
             MarginCommand::StepUpDown(_) => 0b100,
-        };
-        bits << 3
+        }
     }
 
     pub fn payload(&self) -> u8 {
@@ -643,6 +673,20 @@ impl From<u8> for ReportCapabilities {
     }
 }
 
+impl From<ReportCapabilities> for u8 {
+    fn from(r: ReportCapabilities) -> u8 {
+        r.voltage_supported as u8
+            | (r.independent_up_down_voltage as u8) << 1
+            | (r.independent_left_right_sampling as u8) << 2
+            | if matches!(r.sample_reporting_method, SampleReportingMethod::Rate) {
+                1 << 3
+            } else {
+                0
+            }
+            | (r.independent_error_sampler as u8) << 4
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum SampleReportingMethod {
     Rate,
@@ -679,6 +723,18 @@ impl From<u8> for StepMarginExecutionStatus {
             0b00 => StepMarginExecutionStatus::TooManyErrors,
             _ => unreachable!(),
         }
+    }
+}
+
+impl From<StepMarginExecutionStatus> for u8 {
+    fn from(s: StepMarginExecutionStatus) -> u8 {
+        let bits = match s {
+            StepMarginExecutionStatus::Nak => 0b11,
+            StepMarginExecutionStatus::InProgress => 0b10,
+            StepMarginExecutionStatus::Setup => 0b01,
+            StepMarginExecutionStatus::TooManyErrors => 0b00,
+        };
+        bits << 6
     }
 }
 
@@ -955,6 +1011,41 @@ impl MarginResponse {
             }),
         }
     }
+
+    pub fn margin_type(&self) -> u8 {
+        match self {
+            MarginResponse::NoCommand => 0b111,
+            MarginResponse::Report(_) => 0b001,
+            MarginResponse::ErrorCountLimit(_)
+            | MarginResponse::GoToNormalSettings
+            | MarginResponse::ClearErrorLog => 0b010,
+            MarginResponse::StepExecutionStatus { .. } => 0b011,
+            MarginResponse::Empty => 0b000,
+        }
+    }
+
+    pub fn payload(&self) -> u8 {
+        match self {
+            MarginResponse::NoCommand => 0x9C,
+            MarginResponse::Report(ReportResponse::Capabilities(p)) => (*p).into(),
+            MarginResponse::Report(ReportResponse::NumVoltageSteps(p)) => *p,
+            MarginResponse::Report(ReportResponse::NumTimingSteps(p)) => *p,
+            MarginResponse::Report(ReportResponse::MaxTimingOffset(p)) => *p,
+            MarginResponse::Report(ReportResponse::MaxVoltageOffset(p)) => *p,
+            MarginResponse::Report(ReportResponse::SamplingRateVoltage(p)) => *p,
+            MarginResponse::Report(ReportResponse::SamplingRateTiming(p)) => *p,
+            MarginResponse::Report(ReportResponse::SampleCount(p)) => *p,
+            MarginResponse::Report(ReportResponse::MaxLanes(p)) => *p,
+            MarginResponse::ErrorCountLimit(count) => u8::from(*count),
+            MarginResponse::GoToNormalSettings => 0x0F,
+            MarginResponse::ClearErrorLog => 0x55,
+            MarginResponse::StepExecutionStatus {
+                status,
+                error_count,
+            } => u8::from(*status) | u8::from(*error_count),
+            MarginResponse::Empty => 0x00,
+        }
+    }
 }
 
 /// Combination of the margining control and status registers for a lane
@@ -1007,6 +1098,7 @@ struct LaneMarginInner {
     header: LaneMarginingCapabilityHeader,
     cmd_offset: usize,
     sts_offset: usize,
+    verbosity: u64,
 }
 
 impl LaneMarginInner {
@@ -1080,7 +1172,15 @@ impl LaneMarginInner {
         } else {
             u8::from(self.receiver)
         };
-        let words = [margin_type | receiver, payload];
+        if self.verbosity >= verbosity::COMMAND_DETAIL {
+            println!(
+                "-> {cmd:?}, Margin type: {margin_type:#03b}, \
+                 Receiver: {receiver:#03b}, Payload: {payload:#08b}"
+            );
+        } else if self.verbosity >= verbosity::COMMANDS {
+            println!("-> {cmd:?}");
+        }
+        let words = [margin_type << 3 | receiver, payload];
         u16::from_le_bytes(words)
     }
 
@@ -1096,6 +1196,17 @@ impl LaneMarginInner {
             // maximum wait time.
             let response = self.read_command_response(cmd);
             if let Ok(response) = response {
+                if self.verbosity >= verbosity::COMMAND_DETAIL {
+                    println!(
+                        "<- {response:?}, Margin type: {:#03b}, \
+                        Receiver: {:#03b}, Payload: {:#08b}",
+                        response.margin_type(),
+                        u8::from(self.receiver),
+                        response.payload(),
+                    );
+                } else if self.verbosity >= verbosity::COMMANDS {
+                    println!("<- {response:?}");
+                }
                 if cmd.expects_response(response) {
                     return Ok(response);
                 }
@@ -1109,7 +1220,8 @@ impl LaneMarginInner {
         Err(Error::Margin(format!(
             concat!(
                 "margining failed, did not find expected response ",
-                "for command {:?} within time limit of {:?}: {:?}",
+                "for command {:?} within time limit of {:?}: ",
+                "instead found {:?}",
             ),
             cmd, MAX_WAIT_TIME, response
         )))
@@ -1333,7 +1445,12 @@ pub struct LaneMargin {
 }
 
 impl LaneMargin {
-    pub fn new(device: PcieDevice, receiver: Receiver, lane: Lane) -> Result<Self, Error> {
+    pub fn new(
+        device: PcieDevice,
+        receiver: Receiver,
+        lane: Lane,
+        verbosity: u64,
+    ) -> Result<Self, Error> {
         // Find the size of the capability header, limited to the width of the
         // link.
         let link_status = device.link_status()?;
@@ -1365,6 +1482,7 @@ impl LaneMargin {
             lane,
             cmd_offset,
             sts_offset,
+            verbosity,
         };
         let capabilities = inner.report_capabilities()?;
         inner.no_command()?;
@@ -1860,7 +1978,7 @@ fn main() -> anyhow::Result<()> {
     let device = PcieDevice::new(args.bdf).context("Failed to create PCIe device")?;
     let link_status = device.link_status().context("Failed to get link status")?;
 
-    if args.verbose > 1 {
+    if args.verbose > verbosity::LINK_STATUS {
         println!("{:#x?}", link_status);
     }
 
@@ -1877,14 +1995,18 @@ fn main() -> anyhow::Result<()> {
         link_status.width,
     );
 
-    let margin =
-        LaneMargin::new(device, receiver, lane).context("Could not initialize lane margining")?;
+    let margin = LaneMargin::new(device, receiver, lane, args.verbose)
+        .context("Could not initialize lane margining")?;
     let caps = margin.capabilities();
     let limits = margin.limits();
 
-    if args.verbose > 1 {
+    if args.verbose >= verbosity::CAPABILITIES {
         println!("{:#?}", caps);
         println!("{:#?}", limits);
+    }
+
+    if args.report_only {
+        return Ok(());
     }
 
     if let Some(_count) = args.error_count {
@@ -1894,7 +2016,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let duration = Duration::from_secs_f64(args.duration.max(0.200));
-    if args.verbose > 1 {
+    if args.verbose >= verbosity::MARGIN_DURATION {
         println!("Margin duration {:?}", duration);
     }
 
@@ -1914,7 +2036,7 @@ fn main() -> anyhow::Result<()> {
         .create_new(true)
         .open(&filename)
         .context("Failed to create output file")?;
-    if args.verbose > 0 {
+    if args.verbose >= verbosity::FILENAME {
         println!("Writing results to: \"{}\"", filename);
     }
 
@@ -1942,12 +2064,12 @@ fn main() -> anyhow::Result<()> {
             .margin_at_left_right(step, duration)
             .context(format!("Failed to margin point: {step:?}"))?;
         left_right.push((step, margin_duration, result));
-        if args.verbose > 1 {
+        if args.verbose > verbosity::PROGRESS_SUMMARY {
             println!(
                 "{}/{n_steps}: {step:?}, Duration: {margin_duration:?}, {result:?}",
                 i + 1
             );
-        } else if args.verbose == 1 {
+        } else if args.verbose == verbosity::PROGRESS_SUMMARY {
             if i < n_steps - 1 {
                 print!("\rMargining time: {}/{n_steps}", i + 1);
                 std::io::stdout().flush().unwrap();
@@ -1975,7 +2097,7 @@ fn main() -> anyhow::Result<()> {
         )
         .unwrap();
     }
-    if args.verbose == 1 {
+    if args.verbose == verbosity::PROGRESS_SUMMARY {
         println!("");
     }
 
@@ -1991,12 +2113,12 @@ fn main() -> anyhow::Result<()> {
             .margin_at_up_down(step, duration)
             .context(format!("Failed to margin point: {step:?}"))?;
         up_down.push((step, margin_duration, result));
-        if args.verbose > 1 {
+        if args.verbose > verbosity::PROGRESS_SUMMARY {
             println!(
                 "{}/{n_steps}: {step:?}, Duration: {margin_duration:?}, {result:?}",
                 i + 1
             );
-        } else if args.verbose > 0 {
+        } else if args.verbose == verbosity::PROGRESS_SUMMARY {
             if i < n_steps - 1 {
                 print!("\rMargining voltage: {}/{n_steps}", i + 1);
                 std::io::stdout().flush().unwrap();
