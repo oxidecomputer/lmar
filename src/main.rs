@@ -1232,11 +1232,14 @@ impl LaneMarginInner {
         MarginResponse::decode_for_cmd(cmd, word)
     }
 
-    fn gather_limits(&self) -> Result<MarginingLimits, Error> {
-        let caps = self.report_capabilities()?;
+    fn gather_limits(&self, caps: &ReportCapabilities) -> Result<MarginingLimits, Error> {
         let num_voltage_steps = if caps.voltage_supported {
             match self.report(ReportRequest::NumVoltageSteps)? {
-                ReportResponse::NumVoltageSteps(steps) => Some(steps),
+                ReportResponse::NumVoltageSteps(steps) => {
+                    let steps = Some(steps);
+                    self.no_command()?;
+                    steps
+                }
                 other => {
                     return Err(Error::Margin(format!(
                         "Unexpected response requesting NumVoltageSteps: {:?}",
@@ -1247,10 +1250,12 @@ impl LaneMarginInner {
         } else {
             None
         };
-        self.no_command()?;
 
         let num_timing_steps = match self.report(ReportRequest::NumTimingSteps)? {
-            ReportResponse::NumTimingSteps(steps) => steps,
+            ReportResponse::NumTimingSteps(steps) => {
+                self.no_command()?;
+                steps
+            }
             other => {
                 return Err(Error::Margin(format!(
                     "Unexpected response requesting NumTimingSteps: {:?}",
@@ -1258,10 +1263,12 @@ impl LaneMarginInner {
                 )));
             }
         };
-        self.no_command()?;
 
         let max_timing_offset = match self.report(ReportRequest::MaxTimingOffset)? {
-            ReportResponse::MaxTimingOffset(offset) => offset,
+            ReportResponse::MaxTimingOffset(offset) => {
+                self.no_command()?;
+                offset
+            }
             other => {
                 return Err(Error::Margin(format!(
                     "Unexpected response requesting MaxTimingOffset: {:?}",
@@ -1269,11 +1276,14 @@ impl LaneMarginInner {
                 )));
             }
         };
-        self.no_command()?;
 
         let max_voltage_offset = if caps.voltage_supported {
             match self.report(ReportRequest::MaxVoltageOffset)? {
-                ReportResponse::MaxVoltageOffset(offset) => Some(offset),
+                ReportResponse::MaxVoltageOffset(offset) => {
+                    let offset = Some(offset);
+                    self.no_command()?;
+                    offset
+                }
                 other => {
                     return Err(Error::Margin(format!(
                         "Unexpected response requesting MaxVoltageOffset: {:?}",
@@ -1284,11 +1294,14 @@ impl LaneMarginInner {
         } else {
             None
         };
-        self.no_command()?;
 
         let sampling_rate_voltage = if caps.voltage_supported {
             match self.report(ReportRequest::SamplingRateVoltage)? {
-                ReportResponse::SamplingRateVoltage(rate) => Some(rate),
+                ReportResponse::SamplingRateVoltage(rate) => {
+                    let rate = Some(rate);
+                    self.no_command()?;
+                    rate
+                }
                 other => {
                     return Err(Error::Margin(format!(
                         "Unexpected response requesting SamplingRateVoltage: {:?}",
@@ -1299,10 +1312,12 @@ impl LaneMarginInner {
         } else {
             None
         };
-        self.no_command()?;
 
         let sampling_rate_timing = match self.report(ReportRequest::SamplingRateTiming)? {
-            ReportResponse::SamplingRateTiming(rate) => rate,
+            ReportResponse::SamplingRateTiming(rate) => {
+                self.no_command()?;
+                rate
+            }
             other => {
                 return Err(Error::Margin(format!(
                     "Unexpected response requesting SamplingRateTiming: {:?}",
@@ -1310,7 +1325,6 @@ impl LaneMarginInner {
                 )));
             }
         };
-        self.no_command()?;
 
         Ok(MarginingLimits {
             num_voltage_steps,
@@ -1486,7 +1500,7 @@ impl LaneMargin {
         };
         let capabilities = inner.report_capabilities()?;
         inner.no_command()?;
-        let limits = inner.gather_limits()?;
+        let limits = inner.gather_limits(&capabilities)?;
         Ok(Self {
             inner,
             capabilities,
