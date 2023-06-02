@@ -2138,7 +2138,6 @@ fn main() -> anyhow::Result<()> {
     for lane in lanes.iter().copied() {
         let device_ = device.try_clone()?;
         let tx_ = tx.clone();
-        let (file, filename) = open_margin_results_file(&device_, &lane)?;
 
         // Construct object for running the margining protocol.
         let margin = LaneMargin::new(device_, receiver, lane, args.verbose)
@@ -2147,7 +2146,7 @@ fn main() -> anyhow::Result<()> {
         // All margining threads will send us this report of
         // capabilities. Let's only print one of them.
         let limits = margin.limits();
-        if !printed_caps && args.verbose >= verbosity::CAPABILITIES {
+        if !printed_caps && (args.verbose >= verbosity::CAPABILITIES || args.report_only) {
             let capabilities = margin.capabilities();
             println!("lmar: {capabilities:#?}");
             println!("lmar: {limits:#?}");
@@ -2163,6 +2162,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Spawn a thread for actually running the protocol.
+        let (file, filename) = open_margin_results_file(&device, &lane)?;
         let thr = thread::spawn(move || margin_lane(margin, duration, args.error_count, tx_));
         if args.verbose >= verbosity::FILENAME {
             println!("lmar: saving lane {} to \"{}\"", lane, filename);
