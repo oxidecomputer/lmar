@@ -4,9 +4,14 @@
 
 //! PCIe lane margining at the receiver prototype.
 
+use anyhow::ensure;
 use anyhow::Context;
 use clap::ArgEnum;
 use clap::Parser;
+use indicatif::MultiProgress;
+use indicatif::ProgressBar;
+use indicatif::ProgressDrawTarget;
+use indicatif::ProgressStyle;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fmt;
@@ -15,6 +20,8 @@ use std::io;
 use std::io::Write;
 use std::num::NonZeroU8;
 use std::os::unix::io::AsRawFd;
+use std::sync::mpsc;
+use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 use std::time::Instant;
@@ -46,13 +53,53 @@ mod verbosity {
     pub const PROGRESS_SUMMARY: u64 = 1;
 
     // Print all commands in Rust debug format
-    pub const COMMANDS: u64 = 2;
+    pub const COMMANDS: u64 = 3;
 
     // Print all command register bit fields.
-    pub const COMMAND_DETAIL: u64 = 3;
+    pub const COMMAND_DETAIL: u64 = 4;
 }
 
-#[derive(Parser, Debug)]
+#[derive(Clone, Debug)]
+enum LaneDescription {
+    ByIndex(Vec<u8>),
+    All,
+}
+
+impl LaneDescription {
+    fn to_indices(&self, link_status: &LinkStatus) -> anyhow::Result<Vec<Lane>> {
+        let to_lane = |l: u8| {
+            ensure!(l < link_status.width.0, "Lane {} out of range", l);
+            Lane::new(l).context("Invalid lane")
+        };
+        match self {
+            LaneDescription::ByIndex(ref lanes) => lanes.iter().map(|l| to_lane(*l)).collect(),
+            LaneDescription::All => (0..u8::from(link_status.width)).map(to_lane).collect(),
+        }
+    }
+}
+
+impl std::str::FromStr for LaneDescription {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "all" {
+            return Ok(LaneDescription::All);
+        }
+        let mut indices = Vec::new();
+        for part in s.split(',') {
+            if let Some((lhs, rhs)) = part.split_once('-') {
+                let start = lhs.parse::<u8>()?;
+                let end = rhs.parse::<u8>()?;
+                indices.extend(start..=end);
+            } else {
+                indices.push(part.parse()?);
+            }
+        }
+        Ok(LaneDescription::ByIndex(indices))
+    }
+}
+
+#[derive(Parser, Clone, Debug)]
 #[clap(author, version, about, long_about = None)]
 /// The `lmar` program is a prototype tool to run the PCIe Lane Margining at the
 /// Receiver protocol on an attached PCIe endpoint.
@@ -77,20 +124,20 @@ struct Args {
     #[clap(arg_enum)]
     port: Port,
 
-    /// Output file name, for saving the margining data.
-    ///
-    /// Default is a name based on the bus/device/function and timestamp, to
-    /// avoid clobbering past results.
-    #[clap(short, long)]
-    output: Option<String>,
-
     /// The time to spend margining each point, in seconds.
     #[clap(short, long, default_value_t = 1.0)]
     duration: f64,
 
-    /// The lane on the endpoint to be margined.
-    #[clap(short, long, default_value_t = 0)]
-    lane: u8,
+    /// The lane(s) on the endpoint to be margined.
+    ///
+    /// This defaults to margining just the first lane (lane 0). It may be
+    /// specified as a comma- or dash-separated list of values, to indicate the
+    /// exact lane numbers to margin; or as the string "all" to margin all lanes
+    /// on the device.
+    ///
+    /// Multiple lanes will be margined in parallel.
+    #[clap(short, long, default_value = "0")]
+    lanes: LaneDescription,
 
     /// The maximum acceptable error count at a point.
     ///
@@ -373,7 +420,7 @@ impl TryFrom<u16> for LinkStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Lane(u8);
 
 impl Lane {
@@ -1104,8 +1151,7 @@ struct LaneMarginInner {
 impl LaneMarginInner {
     fn report(&self, request: ReportRequest) -> Result<ReportResponse, Error> {
         let cmd = MarginCommand::Report(request);
-        let word = self.build_command(cmd);
-        write_configuration_space(&self.device.file, &self.device.bdf, self.cmd_offset, word)?;
+        self.write_command(cmd)?;
         match self.wait_for_response(cmd)? {
             MarginResponse::Report(report) => Ok(report),
             other => Err(Error::Margin(format!(
@@ -1127,8 +1173,7 @@ impl LaneMarginInner {
 
     fn no_command(&self) -> Result<(), Error> {
         let cmd = MarginCommand::NoCommand;
-        let word = self.build_command(cmd);
-        write_configuration_space(&self.device.file, &self.device.bdf, self.cmd_offset, word)?;
+        self.write_command(cmd)?;
         match self.wait_for_response(cmd)? {
             MarginResponse::NoCommand => Ok(()),
             other => Err(Error::Margin(format!(
@@ -1140,8 +1185,7 @@ impl LaneMarginInner {
 
     fn clear_error_log(&self) -> Result<(), Error> {
         let cmd = MarginCommand::ClearErrorLog;
-        let word = self.build_command(cmd);
-        write_configuration_space(&self.device.file, &self.device.bdf, self.cmd_offset, word)?;
+        self.write_command(cmd)?;
         match self.wait_for_response(cmd)? {
             MarginResponse::ClearErrorLog => Ok(()),
             other => Err(Error::Margin(format!(
@@ -1153,8 +1197,7 @@ impl LaneMarginInner {
 
     fn go_to_normal_settings(&self) -> Result<(), Error> {
         let cmd = MarginCommand::GoToNormalSettings;
-        let word = self.build_command(cmd);
-        write_configuration_space(&self.device.file, &self.device.bdf, self.cmd_offset, word)?;
+        self.write_command(cmd)?;
         match self.wait_for_response(cmd)? {
             MarginResponse::GoToNormalSettings => Ok(()),
             other => Err(Error::Margin(format!(
@@ -1225,6 +1268,11 @@ impl LaneMarginInner {
             ),
             cmd, MAX_WAIT_TIME, response
         )))
+    }
+
+    fn write_command(&self, cmd: MarginCommand) -> Result<(), Error> {
+        let word = self.build_command(cmd);
+        write_configuration_space(&self.device.file, &self.device.bdf, self.cmd_offset, word)
     }
 
     fn read_command_response(&self, cmd: MarginCommand) -> Result<MarginResponse, Error> {
@@ -1339,8 +1387,7 @@ impl LaneMarginInner {
     pub fn set_error_count_limit(&self, count: u8) -> Result<(), Error> {
         let limit = ErrorCount::from(count);
         let cmd = MarginCommand::SetErrorCountLimit(limit);
-        let word = self.build_command(cmd);
-        write_configuration_space(&self.device.file, &self.device.bdf, self.cmd_offset, word)?;
+        self.write_command(cmd)?;
         let response = self.wait_for_response(cmd)?;
         match response {
             MarginResponse::ErrorCountLimit(actual_limit) => {
@@ -1361,8 +1408,7 @@ impl LaneMarginInner {
         cmd: MarginCommand,
         duration: Duration,
     ) -> Result<(Duration, MarginResult), Error> {
-        let word = self.build_command(cmd);
-        write_configuration_space(&self.device.file, &self.device.bdf, self.cmd_offset, word)?;
+        self.write_command(cmd)?;
 
         // Interval between checks when execution status is "setup"
         const INTERVAL: Duration = Duration::from_millis(1);
@@ -1479,7 +1525,7 @@ impl LaneMargin {
                 "Margining appears unsupported on this device"
             )));
         }
-        let header_offset = device
+        let header_offset = *device
             .find_extended_capability(&ExtendedCapabilityId::LaneMargining)
             .ok_or_else(|| {
                 Error::Margin(format!(
@@ -1514,12 +1560,6 @@ impl LaneMargin {
 
     pub fn device_id(&self) -> u16 {
         self.inner.device.device_id
-    }
-
-    /// Consume the lane margin controller, and return the device. This is
-    /// useful for running the margining protocol on a new lane or receiver.
-    pub fn device(self) -> PcieDevice {
-        self.inner.device
     }
 
     pub fn header(&self) -> &LaneMarginingCapabilityHeader {
@@ -1758,7 +1798,7 @@ impl DataWord for u64 {
 pub struct PcieDevice {
     pub vendor_id: u16,
     pub device_id: u16,
-    bdf: Bdf,
+    pub bdf: Bdf,
     capabilities: BTreeMap<usize, CapabilityId>,
     extended_capabilities: BTreeMap<usize, ExtendedCapability>,
     file: File,
@@ -1781,6 +1821,25 @@ impl PcieDevice {
             bdf,
             capabilities,
             extended_capabilities,
+            file,
+        })
+    }
+
+    /// Try to clone `self`.
+    ///
+    /// This is fallible because it opens a new file for operating on the PCIe
+    /// registers.
+    pub fn try_clone(&self) -> Result<Self, Error> {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(PCI_REG_DEVICE_FILE)?;
+        Ok(Self {
+            vendor_id: self.vendor_id,
+            device_id: self.device_id,
+            bdf: self.bdf,
+            capabilities: self.capabilities.clone(),
+            extended_capabilities: self.extended_capabilities.clone(),
             file,
         })
     }
@@ -1970,20 +2029,69 @@ where
     }
 }
 
+/// A point at which the margining protocol was run.
+#[derive(Debug, Clone, Copy)]
+pub enum MarginPoint {
+    /// Margined at a non-default position in time, with the percent of the unit
+    /// interval (UI) as the argument.
+    Time(f64),
+    /// Margined at a non-default position in voltage, with the actual voltage
+    /// as the argument.
+    Voltage(f64),
+}
+
+impl MarginPoint {
+    /// Return the time offset of the margin point as a float.
+    pub fn time(&self) -> f64 {
+        match self {
+            MarginPoint::Time(t) => *t,
+            _ => 0.0,
+        }
+    }
+
+    /// Return the voltage offset of the margin point as a float.
+    pub fn voltage(&self) -> f64 {
+        match self {
+            MarginPoint::Voltage(v) => *v,
+            _ => 0.0,
+        }
+    }
+}
+
+/// The result of margining a single point.
 #[derive(Debug, Clone, Copy)]
 pub enum MarginResult {
     Success(ErrorCount),
     Failed(ErrorCount),
 }
 
-fn write_file_header(outfile: &mut File, margin: &LaneMargin) -> std::io::Result<()> {
-    writeln!(outfile, "Vendor ID: {:#x}", margin.vendor_id(),)?;
-    writeln!(outfile, "Device ID: {:#x}", margin.device_id(),)?;
-    writeln!(outfile, "Lane: {}", margin.lane(),)?;
+fn write_file_header(outfile: &mut File, device: &PcieDevice, lane: &Lane) -> std::io::Result<()> {
+    writeln!(outfile, "Vendor ID: {:#x}", device.vendor_id)?;
+    writeln!(outfile, "Device ID: {:#x}", device.device_id)?;
+    writeln!(outfile, "Lane: {}", lane)?;
     writeln!(
         outfile,
         "Time (%UI)\tVoltage (V)\tDuration (s)\tCount\tPass"
     )
+}
+
+fn open_margin_results_file(device: &PcieDevice, lane: &Lane) -> anyhow::Result<(File, String)> {
+    let filename = format!(
+        "margin-results-b{:x}-d{:x}-f{:x}-l{}-{}.txt",
+        device.bdf.bus,
+        device.bdf.device,
+        device.bdf.function,
+        lane,
+        chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S"),
+    );
+    let mut outfile = File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&filename)
+        .context("Failed to create output file")?;
+    write_file_header(&mut outfile, device, lane)?;
+    Ok((outfile, filename))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1993,7 +2101,12 @@ fn main() -> anyhow::Result<()> {
     let link_status = device.link_status().context("Failed to get link status")?;
 
     if args.verbose > verbosity::LINK_STATUS {
-        println!("{:#x?}", link_status);
+        println!("lmar: {:#x?}", link_status);
+    }
+
+    let duration = Duration::from_secs_f64(args.duration.max(0.200));
+    if args.verbose >= verbosity::MARGIN_DURATION {
+        println!("lmar: margin duration {:?}", duration);
     }
 
     let receiver = match args.port {
@@ -2001,164 +2114,329 @@ fn main() -> anyhow::Result<()> {
         Port::Downstream => Receiver::downstream(),
     };
 
-    let lane = Lane::new(args.lane).context("Invalid lane")?;
-    assert!(
-        link_status.valid_lane(lane),
-        "Lane {} is invalid for a device with link width {}",
-        lane,
-        link_status.width,
-    );
+    let lanes = args.lanes.to_indices(&link_status)?;
+    if args.verbose >= verbosity::PROGRESS_SUMMARY {
+        println!("lmar: margining lanes: {lanes:?}");
+    }
 
-    let margin = LaneMargin::new(device, receiver, lane, args.verbose)
-        .context("Could not initialize lane margining")?;
-    let caps = margin.capabilities();
+    // Each lane will be margined in a thread, and will send updates to the main
+    // thread for (1) writing to a file and (2) printing progress.
+    let (tx, rx) = mpsc::channel();
+
+    // Create the multiprogress bar for printing the progress of each lane and
+    // dimension, if the verbosity level calls for it.
+    let progress = if args.verbose == verbosity::PROGRESS_SUMMARY {
+        Some(MultiProgress::with_draw_target(ProgressDrawTarget::hidden()))
+    } else {
+        None
+    };
+
+    // Keep track of the state for each lane's margining protocol.
+    let mut state = BTreeMap::new();
+    let mut printed_caps = false;
+    let mut margining_limits = None;
+    for lane in lanes.iter().copied() {
+        let device_ = device.try_clone()?;
+        let tx_ = tx.clone();
+        let (file, filename) = open_margin_results_file(&device_, &lane)?;
+
+        // Construct object for running the margining protocol.
+        let margin = LaneMargin::new(device_, receiver, lane, args.verbose)
+            .context("Could not initialize lane margining")?;
+
+        // All margining threads will send us this report of
+        // capabilities. Let's only print one of them.
+        let limits = margin.limits();
+        if !printed_caps && args.verbose >= verbosity::CAPABILITIES {
+            let capabilities = margin.capabilities();
+            println!("lmar: {capabilities:#?}");
+            println!("lmar: {limits:#?}");
+            printed_caps = true;
+        }
+        margining_limits.replace(limits.clone());
+
+        // If we're just reporting the capabilities and limits of the device, we
+        // do not need to do anything else at all. We've printed them, and
+        // they're the same for all lanes. Exit successfully.
+        if args.report_only {
+            return Ok(());
+        }
+
+        // Spawn a thread for actually running the protocol.
+        let thr = thread::spawn(move || margin_lane(margin, duration, args.error_count, tx_));
+        if args.verbose >= verbosity::FILENAME {
+            println!("lmar: saving lane {} to \"{}\"", lane, filename);
+        }
+
+        // Insert a small delay between each lane. This is not strictly
+        // necessary, but may help improve throughput a bit.
+        thread::sleep(duration / lanes.len() as u32);
+
+        // Setup the progress bars for this lane, if the verbosity level
+        // requires it.
+        let bars = if args.verbose == verbosity::PROGRESS_SUMMARY {
+            let bars = ProgressBars::new(&lane, margining_limits.as_ref().unwrap());
+            let mp = progress.as_ref().expect("No progress bars!");
+            mp.add(bars.time.clone());
+            if let Some(vb) = bars.voltage.as_ref() {
+                mp.add(vb.clone());
+            }
+            Some(bars)
+        } else {
+            None
+        };
+
+        // Store the state for this lane's margin worker.
+        state.insert(
+            lane,
+            MarginState {
+                thr,
+                file,
+                n_points: (0, 0),
+                bars,
+            },
+        );
+    }
+
+    // Unhide the progress bars, and tick them all manually so that they draw to
+    // the screen now, rather than when we update them. That's because the
+    // voltage progress bars won't appear until we start margining in that
+    // direction otherwise.
+    if let Some(p) = &progress {
+        p.set_draw_target(ProgressDrawTarget::stdout());
+        for st in state.values() {
+            if let Some(bars) = &st.bars {
+                bars.time.tick();
+                if let Some(vb) = &bars.voltage {
+                    vb.tick();
+                }
+            }
+        }
+    }
+
+    // Close our own sender, so that this call returns an error when all
+    // per-thread senders are closed.
+    drop(tx);
+    while let Ok(update) = rx.recv() {
+        let st = state
+            .get_mut(&update.lane)
+            .expect("No margining state for lane");
+        let limits = margining_limits
+            .as_ref()
+            .expect("Limits should be reported before margining starts");
+
+        // Update the number of points we've margined for this lane, and
+        // get the total we expect based on the reported capabilities.
+        let (n_points, n_total_points) = if matches!(update.point, MarginPoint::Time(_)) {
+            st.n_points.0 += 1;
+            (st.n_points.0, limits.num_timing_steps * 2)
+        } else {
+            st.n_points.1 += 1;
+            (
+                st.n_points.1,
+                limits.num_voltage_steps.expect(
+                    "Received margin update for voltage for a \
+                    device that doesn't appear to support \
+                    voltage margining",
+                ) * 2,
+            )
+        };
+
+        // Write the result to the output file.
+        let (pass, count) = match update.result {
+            MarginResult::Success(count) => (1, u8::from(count)),
+            MarginResult::Failed(count) => (0, u8::from(count)),
+        };
+        writeln!(
+            st.file,
+            "{:0.3}\t{:0.3}\t{:0.9}\t{}\t{}",
+            update.point.time(),
+            update.point.voltage(),
+            update.duration.as_secs_f64(),
+            count,
+            pass,
+        )
+        .unwrap();
+
+        // Print the progress to the screen, if needed.
+        //
+        // We drop `st` so that we can maybe iterate over all the state
+        // items in some cases.
+        drop(st);
+        if args.verbose > verbosity::PROGRESS_SUMMARY {
+            println!("lmar: margined point {n_points} / {n_total_points}: {update:?}");
+        } else if args.verbose == verbosity::PROGRESS_SUMMARY {
+            let st = state.get_mut(&update.lane).unwrap();
+            let bars = st.bars.as_ref().expect("No progress bars!");
+            if matches!(update.point, MarginPoint::Time(_)) {
+                bars.time.inc(1);
+            } else {
+                let voltage_bar = bars.voltage.as_ref().expect(
+                    "Received voltage update for a \
+                        device that doesn't appear to \
+                        support voltage margining",
+                );
+                voltage_bar.inc(1);
+            }
+        }
+    }
+
+    // Finish the progress bars, leaving them on the screen.
+    for st in state.values() {
+        if let Some(bars) = &st.bars {
+            bars.time.finish();
+            if let Some(vb) = &bars.voltage {
+                vb.finish();
+            }
+        }
+    }
+
+    // Print any error messages the threads hit.
+    for (lane, state) in state.into_iter() {
+        if let Err(e) = state.thr.join() {
+            eprintln!("lmar: margining lane {lane} failed: {e:?}");
+        }
+    }
+
+    Ok(())
+}
+
+// The state maintained for running the margining protocol in a thread.
+#[derive(Debug)]
+struct MarginState {
+    // Handle to the thread running the protocol.
+    thr: thread::JoinHandle<anyhow::Result<()>>,
+    // File to which results are saved.
+    file: File,
+    // The number of points margined, for voltage and time.
+    n_points: (u8, u8),
+    // The progress bars, if the summary verbosity level was chosen.
+    bars: Option<ProgressBars>,
+}
+
+// The progress bars for a single lane.
+#[derive(Debug)]
+struct ProgressBars {
+    time: ProgressBar,
+    voltage: Option<ProgressBar>,
+}
+
+impl ProgressBars {
+    /// Create the progress bars for a lane, from the margining limits.
+    pub fn new(lane: &Lane, limits: &MarginingLimits) -> Self {
+        let time = ProgressBar::with_draw_target(
+            Some(u64::from(limits.num_timing_steps) * 2),
+            ProgressDrawTarget::hidden(),
+        );
+        time.set_style(ProgressStyle::with_template("{prefix:24}: {bar} {pos} / {len}").unwrap());
+        time.set_prefix(format!("lmar: lane {lane} (time)"));
+        time.tick();
+        let voltage = limits.num_voltage_steps.map(|n_steps| {
+            let voltage = ProgressBar::with_draw_target(
+                Some(u64::from(n_steps) * 2),
+                ProgressDrawTarget::hidden(),
+            );
+            voltage.set_style(
+                ProgressStyle::with_template("{prefix:24}: {bar} {pos} / {len}").unwrap(),
+            );
+            voltage.set_prefix(format!("lmar: lane {lane} (voltage)"));
+            voltage.tick();
+            voltage
+        });
+        Self { time, voltage }
+    }
+}
+
+// An update from a thread about margining a single point.
+#[derive(Debug)]
+struct MarginUpdate {
+    // The lane being margined.
+    lane: Lane,
+    // The duration of the margin process.
+    duration: Duration,
+    // The point at which the lane was margined, in either voltage or time.
+    point: MarginPoint,
+    // The result of the margining process.
+    result: MarginResult,
+}
+
+fn margin_lane(
+    margin: LaneMargin,
+    duration: Duration,
+    error_count: Option<u8>,
+    tx: mpsc::Sender<MarginUpdate>,
+) -> anyhow::Result<()> {
+    let lane = margin.lane();
+    let capabilities = margin.capabilities();
     let limits = margin.limits();
-
-    if args.verbose >= verbosity::CAPABILITIES {
-        println!("{:#?}", caps);
-        println!("{:#?}", limits);
-    }
-
-    if args.report_only {
-        return Ok(());
-    }
-
-    if let Some(_count) = args.error_count {
+    if let Some(_count) = error_count {
         /*
         margin.set_error_count_limit(4).unwrap();
         */
     }
 
-    let duration = Duration::from_secs_f64(args.duration.max(0.200));
-    if args.verbose >= verbosity::MARGIN_DURATION {
-        println!("Margin duration {:?}", duration);
-    }
-
-    let filename = args.output.unwrap_or_else(|| {
-        format!(
-            "margin-results-b{:x}-d{:x}-f{:x}-l{}-{}.txt",
-            args.bdf.bus,
-            args.bdf.device,
-            args.bdf.function,
-            args.lane,
-            chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S"),
-        )
-    });
-    let mut outfile = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&filename)
-        .context("Failed to create output file")?;
-    if args.verbose >= verbosity::FILENAME {
-        println!("Writing results to: \"{}\"", filename);
-    }
-
+    // Compute the resolution in both dimensions.
     let timing_resolution: f64 =
         f64::from(limits.max_timing_offset) / f64::from(limits.num_timing_steps);
-    let voltage_resolution: f64 = if caps.voltage_supported {
+    let voltage_resolution: f64 = if capabilities.voltage_supported {
         (f64::from(limits.max_voltage_offset.unwrap())
             / f64::from(limits.num_voltage_steps.unwrap()))
             / 100.0
     } else {
         0.0
     };
-    write_file_header(&mut outfile, &margin)?;
 
+    // Iterate over the timing steps from left to right.
     let steps = margin.iter_left_right_steps();
-    let n_steps = steps.len();
-    let mut left_right: Vec<(StepLeftRight, Duration, MarginResult)> =
-        Vec::with_capacity(steps.len());
-    for (i, step) in steps.into_iter().enumerate() {
+    for step in steps.into_iter() {
+        // Setup per the spec for margining a single point.
         margin.clear_error_log()?;
         margin.go_to_normal_settings()?;
         margin.no_command()?;
 
-        let (margin_duration, result) = margin
-            .margin_at_left_right(step, duration)
-            .context(format!("Failed to margin point: {step:?}"))?;
-        left_right.push((step, margin_duration, result));
-        if args.verbose > verbosity::PROGRESS_SUMMARY {
-            println!(
-                "{}/{n_steps}: {step:?}, Duration: {margin_duration:?}, {result:?}",
-                i + 1
-            );
-        } else if args.verbose == verbosity::PROGRESS_SUMMARY {
-            if i < n_steps - 1 {
-                print!("\rMargining time: {}/{n_steps}", i + 1);
-                std::io::stdout().flush().unwrap();
-            } else {
-                println!("\rMargining time: {}/{n_steps}", i + 1);
-            }
-        }
-
+        // Compute the actual time as a percentage of UI that we're currently
+        // margining.
         let sign = if matches!(step.direction, Some(LeftRight::Left)) {
             -1.0
         } else {
             1.0
         };
-        let (pass, count) = match result {
-            MarginResult::Success(count) => (1, u8::from(count)),
-            MarginResult::Failed(count) => (0, u8::from(count)),
-        };
-        writeln!(
-            outfile,
-            "{:0.3}\t0.00\t{}\t{:0.9}\t{}",
-            sign * timing_resolution * f64::from(u8::from(step.steps)),
-            margin_duration.as_secs_f64(),
-            count,
-            pass,
-        )
-        .unwrap();
-    }
-    if args.verbose == verbosity::PROGRESS_SUMMARY {
-        println!("");
+        let point = MarginPoint::Time(sign * timing_resolution * f64::from(step.steps.0));
+        let (margin_duration, result) = margin
+            .margin_at_left_right(step, duration)
+            .context(format!("Failed to margin point: {step:?}"))?;
+        tx.send(MarginUpdate {
+            lane,
+            point,
+            duration: margin_duration,
+            result,
+        })?;
     }
 
+    // Iterate over the voltage steps, if supported.
     let steps = margin.iter_up_down_steps();
-    let n_steps = steps.len();
-    let mut up_down: Vec<(StepUpDown, Duration, MarginResult)> = Vec::with_capacity(steps.len());
-    for (i, step) in steps.into_iter().enumerate() {
+    for step in steps.into_iter() {
+        // Setup per the spec for margining a single point.
         margin.clear_error_log()?;
         margin.go_to_normal_settings()?;
         margin.no_command()?;
 
-        let (margin_duration, result) = margin
-            .margin_at_up_down(step, duration)
-            .context(format!("Failed to margin point: {step:?}"))?;
-        up_down.push((step, margin_duration, result));
-        if args.verbose > verbosity::PROGRESS_SUMMARY {
-            println!(
-                "{}/{n_steps}: {step:?}, Duration: {margin_duration:?}, {result:?}",
-                i + 1
-            );
-        } else if args.verbose == verbosity::PROGRESS_SUMMARY {
-            if i < n_steps - 1 {
-                print!("\rMargining voltage: {}/{n_steps}", i + 1);
-                std::io::stdout().flush().unwrap();
-            } else {
-                println!("\rMargining voltage: {}/{n_steps}", i + 1);
-            }
-        }
-
+        // Compute the actual voltage at which we're margining.
         let sign = if matches!(step.direction, Some(UpDown::Down)) {
             -1.0
         } else {
             1.0
         };
-        let (pass, count) = match result {
-            MarginResult::Success(count) => (1, u8::from(count)),
-            MarginResult::Failed(count) => (0, u8::from(count)),
-        };
-        writeln!(
-            outfile,
-            "0.00\t{:0.3}\t{}\t{:0.9}\t{}",
-            sign * voltage_resolution * f64::from(u8::from(step.steps)),
-            margin_duration.as_secs_f64(),
-            count,
-            pass,
-        )
-        .unwrap();
+        let point = MarginPoint::Voltage(sign * voltage_resolution * f64::from(step.steps.0));
+        let (margin_duration, result) = margin
+            .margin_at_up_down(step, duration)
+            .context(format!("Failed to margin point: {step:?}"))?;
+        tx.send(MarginUpdate {
+            lane,
+            point,
+            duration: margin_duration,
+            result,
+        })?;
     }
 
     Ok(())

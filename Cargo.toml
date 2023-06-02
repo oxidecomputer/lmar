@@ -10,5 +10,6 @@ anyhow = "1.0.71"
 bytes = "1.1.0"
 chrono = "0.4.19"
 clap = { version = "3.1.18", features = [ "derive" ] }
+indicatif = "0.17.4"
 libc = "0.2.122"
 thiserror = "1.0.30"
