@@ -58,14 +58,14 @@ def load_results(file: str) -> dict[dict]:
     is_voltage = np.logical_not(is_time)
     time_results = dict(
         time=results[is_time, time],
-        count=results[is_time, count].astype(np.int),
+        count=results[is_time, count].astype(np.int64),
         duration=results[is_time, duration],
         passed=results[is_time, passed].astype(np.bool),
         xlabel="Time (% UI)",
     )
     voltage_results = dict(
         voltage=results[is_voltage, voltage],
-        count=results[is_voltage, count].astype(np.int),
+        count=results[is_voltage, count].astype(np.int64),
         duration=results[is_voltage, duration],
         passed=results[is_voltage, passed].astype(np.bool),
         xlabel="Voltage (V)",
@@ -116,7 +116,7 @@ def format_plot(results, fig, axes):
     )
     leg.set_draggable(True)
     fig.tight_layout()
-    fig.canvas.set_window_title(
+    fig.canvas.manager.set_window_title(
         "Vendor: {:x}, Device: {:x}, Lane {:d}".format(
             results["vendor_id"],
             results["device_id"],
