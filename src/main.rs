@@ -192,9 +192,9 @@ pub enum Error {
 }
 
 // Ioctl command definitions
-const PCITOOL_IOC: i32 = (('P' as i32) << 24) | (('C' as i32) << 16) | (('T' as i32) << 8);
-const PCITOOL_DEVICE_GET_REG: i32 = PCITOOL_IOC | 1;
-const PCITOOL_DEVICE_SET_REG: i32 = PCITOOL_IOC | 2;
+const PCITOOL_IOC: u64 = (('P' as u64) << 24) | (('C' as u64) << 16) | (('T' as u64) << 8);
+const PCITOOL_DEVICE_GET_REG: u64 = PCITOOL_IOC | 1;
+const PCITOOL_DEVICE_SET_REG: u64 = PCITOOL_IOC | 2;
 
 // TODO-correctness: The register file should not matter so much, since x86 will
 // ultimately look up the device just by the BDF. But we should still do the
@@ -363,6 +363,7 @@ impl TryFrom<u8> for LinkWidth {
 
 /// Speed of a PCIe link, in GT/s.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct LinkSpeed(f32);
 
 impl TryFrom<u8> for LinkSpeed {
@@ -2259,10 +2260,6 @@ fn main() -> anyhow::Result<()> {
         .unwrap();
 
         // Print the progress to the screen, if needed.
-        //
-        // We drop `st` so that we can maybe iterate over all the state
-        // items in some cases.
-        drop(st);
         if args.verbose > verbosity::PROGRESS_SUMMARY {
             println!("lmar: margined point {n_points} / {n_total_points}: {update:?}");
         } else if args.verbose == verbosity::PROGRESS_SUMMARY {
