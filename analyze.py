@@ -21,7 +21,7 @@ def compute_margin(results, key) -> float:
     if n_passes == 0:
         return 0.0
     if n_passes == len(passed):
-        return independent_axis.ptp()
+        return np.ptp(independent_axis)
 
     # Try to compute the last - first point at which the margining
     # passed. If there are exactly two such points, then we're done.
