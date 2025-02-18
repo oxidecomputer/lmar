@@ -66,14 +66,21 @@ enum LaneDescription {
 }
 
 impl LaneDescription {
-    fn to_indices(&self, link_status: &LinkStatus) -> anyhow::Result<Vec<Lane>> {
+    fn to_indices(
+        &self,
+        link_status: &LinkStatus,
+    ) -> anyhow::Result<Vec<Lane>> {
         let to_lane = |l: u8| {
             ensure!(l < link_status.width.0, "Lane {} out of range", l);
             Lane::new(l).context("Invalid lane")
         };
         match self {
-            LaneDescription::ByIndex(ref lanes) => lanes.iter().map(|l| to_lane(*l)).collect(),
-            LaneDescription::All => (0..u8::from(link_status.width)).map(to_lane).collect(),
+            LaneDescription::ByIndex(ref lanes) => {
+                lanes.iter().map(|l| to_lane(*l)).collect()
+            }
+            LaneDescription::All => {
+                (0..u8::from(link_status.width)).map(to_lane).collect()
+            }
         }
     }
 }
@@ -181,18 +188,18 @@ pub enum Error {
     #[error("An error occurred during lane margining: {0}")]
     Margin(String),
 
-    #[error("Failed to decode response for command {command:?}, reason {reason}")]
-    DecodeFailed {
-        command: MarginCommand,
-        reason: String,
-    },
+    #[error(
+        "Failed to decode response for command {command:?}, reason {reason}"
+    )]
+    DecodeFailed { command: MarginCommand, reason: String },
 
     #[error("Capability or feature not implemented yet: {0}")]
     Unimplemented(String),
 }
 
 // Ioctl command definitions
-const PCITOOL_IOC: i32 = (('P' as i32) << 24) | (('C' as i32) << 16) | (('T' as i32) << 8);
+const PCITOOL_IOC: i32 =
+    (('P' as i32) << 24) | (('C' as i32) << 16) | (('T' as i32) << 8);
 const PCITOOL_DEVICE_GET_REG: i32 = PCITOOL_IOC | 1;
 const PCITOOL_DEVICE_SET_REG: i32 = PCITOOL_IOC | 2;
 
@@ -412,12 +419,7 @@ impl TryFrom<u16> for LinkStatus {
         let width = LinkWidth::try_from((word >> 4) as u8)?;
         let training = (word & (1 << 11)) != 0;
         let active = (word & (1 << 13)) != 0;
-        Ok(Self {
-            speed,
-            width,
-            training,
-            active,
-        })
+        Ok(Self { speed, width, training, active })
     }
 }
 
@@ -482,7 +484,8 @@ impl TryFrom<&[u8]> for LaneMarginingCapabilityHeader {
                 "Lane margining extended capability header too small",
             )));
         }
-        let port_capabilities = MarginingPortCapabilities::from(buf.get_u16_le());
+        let port_capabilities =
+            MarginingPortCapabilities::from(buf.get_u16_le());
         let port_status = MarginingPortStatus::from(buf.get_u16_le());
 
         // Each lane has a control + status register
@@ -490,7 +493,10 @@ impl TryFrom<&[u8]> for LaneMarginingCapabilityHeader {
         let mut lanes = Vec::with_capacity(n_lanes);
         for _ in 0..n_lanes {
             let control = MarginingLaneControl::from(buf.get_u16_le());
-            let status = MarginingLaneStatus::decode_for_cmd(control.cmd, buf.get_u16_le())?;
+            let status = MarginingLaneStatus::decode_for_cmd(
+                control.cmd,
+                buf.get_u16_le(),
+            )?;
             lanes.push(MarginingLane { control, status });
         }
         Ok(LaneMarginingCapabilityHeader {
@@ -510,9 +516,7 @@ pub struct MarginingPortCapabilities {
 
 impl From<u16> for MarginingPortCapabilities {
     fn from(word: u16) -> Self {
-        Self {
-            uses_driver_software: (word & 0x1) != 0,
-        }
+        Self { uses_driver_software: (word & 0x1) != 0 }
     }
 }
 
@@ -528,10 +532,7 @@ impl From<u16> for MarginingPortStatus {
     fn from(word: u16) -> Self {
         let ready = (word & 0b01) != 0;
         let software_ready = (word & 0b10) != 0;
-        Self {
-            ready,
-            software_ready,
-        }
+        Self { ready, software_ready }
     }
 }
 
@@ -621,11 +622,25 @@ impl MarginCommand {
                 MarginCommand::Report(ReportRequest::MaxLanes),
                 MarginResponse::Report(ReportResponse::MaxLanes(_)),
             ) => true,
-            (MarginCommand::SetErrorCountLimit(_), MarginResponse::ErrorCountLimit(_)) => true,
-            (MarginCommand::GoToNormalSettings, MarginResponse::GoToNormalSettings) => true,
-            (MarginCommand::ClearErrorLog, MarginResponse::ClearErrorLog) => true,
-            (MarginCommand::StepLeftRight(_), MarginResponse::StepExecutionStatus { .. }) => true,
-            (MarginCommand::StepUpDown(_), MarginResponse::StepExecutionStatus { .. }) => true,
+            (
+                MarginCommand::SetErrorCountLimit(_),
+                MarginResponse::ErrorCountLimit(_),
+            ) => true,
+            (
+                MarginCommand::GoToNormalSettings,
+                MarginResponse::GoToNormalSettings,
+            ) => true,
+            (MarginCommand::ClearErrorLog, MarginResponse::ClearErrorLog) => {
+                true
+            }
+            (
+                MarginCommand::StepLeftRight(_),
+                MarginResponse::StepExecutionStatus { .. },
+            ) => true,
+            (
+                MarginCommand::StepUpDown(_),
+                MarginResponse::StepExecutionStatus { .. },
+            ) => true,
             (_, _) => false,
         }
     }
@@ -649,7 +664,9 @@ impl From<u16> for MarginCommand {
             0b010 => match payload {
                 0x0F => MarginCommand::GoToNormalSettings,
                 0x55 => MarginCommand::ClearErrorLog,
-                _ => MarginCommand::SetErrorCountLimit(ErrorCount::from(payload)),
+                _ => {
+                    MarginCommand::SetErrorCountLimit(ErrorCount::from(payload))
+                }
             },
             0b011 => MarginCommand::StepLeftRight(StepLeftRight::from(payload)),
             0b100 => MarginCommand::StepUpDown(StepUpDown::from(payload)),
@@ -726,7 +743,10 @@ impl From<ReportCapabilities> for u8 {
         r.voltage_supported as u8
             | (r.independent_up_down_voltage as u8) << 1
             | (r.independent_left_right_sampling as u8) << 2
-            | if matches!(r.sample_reporting_method, SampleReportingMethod::Rate) {
+            | if matches!(
+                r.sample_reporting_method,
+                SampleReportingMethod::Rate
+            ) {
                 1 << 3
             } else {
                 0
@@ -968,7 +988,10 @@ impl MarginResponse {
     // Responses cannot be uniquely decoded from the u16 word alone, since the
     // interpretation of the payload depends on the payload of the corresponding
     // margin command word.
-    pub fn decode_for_cmd(cmd: MarginCommand, word: u16) -> Result<Self, Error> {
+    pub fn decode_for_cmd(
+        cmd: MarginCommand,
+        word: u16,
+    ) -> Result<Self, Error> {
         let (response_cmd, payload) = {
             let octets = word.to_le_bytes();
             (octets[0], octets[1])
@@ -980,13 +1003,19 @@ impl MarginResponse {
                 if payload != 0x9C {
                     return Err(Error::DecodeFailed {
                         command: cmd,
-                        reason: format!("Expected payload 0x9C, found: {:#x}", payload),
+                        reason: format!(
+                            "Expected payload 0x9C, found: {:#x}",
+                            payload
+                        ),
                     });
                 }
                 if receiver != 0 {
                     return Err(Error::DecodeFailed {
                         command: cmd,
-                        reason: format!("Expected receiver 0x0, found: {:#x}", receiver),
+                        reason: format!(
+                            "Expected receiver 0x0, found: {:#x}",
+                            receiver
+                        ),
                     });
                 }
                 Ok(MarginResponse::NoCommand)
@@ -995,11 +1024,19 @@ impl MarginResponse {
                 if let MarginCommand::Report(report) = cmd {
                     let report_response = match report {
                         ReportRequest::Capabilities => {
-                            ReportResponse::Capabilities(ReportCapabilities::from(payload))
+                            ReportResponse::Capabilities(
+                                ReportCapabilities::from(payload),
+                            )
                         }
-                        ReportRequest::NumVoltageSteps => ReportResponse::NumVoltageSteps(payload),
-                        ReportRequest::NumTimingSteps => ReportResponse::NumTimingSteps(payload),
-                        ReportRequest::MaxTimingOffset => ReportResponse::MaxTimingOffset(payload),
+                        ReportRequest::NumVoltageSteps => {
+                            ReportResponse::NumVoltageSteps(payload)
+                        }
+                        ReportRequest::NumTimingSteps => {
+                            ReportResponse::NumTimingSteps(payload)
+                        }
+                        ReportRequest::MaxTimingOffset => {
+                            ReportResponse::MaxTimingOffset(payload)
+                        }
                         ReportRequest::MaxVoltageOffset => {
                             ReportResponse::MaxVoltageOffset(payload)
                         }
@@ -1009,8 +1046,12 @@ impl MarginResponse {
                         ReportRequest::SamplingRateTiming => {
                             ReportResponse::SamplingRateTiming(payload)
                         }
-                        ReportRequest::SampleCount => ReportResponse::SampleCount(payload),
-                        ReportRequest::MaxLanes => ReportResponse::MaxLanes(payload),
+                        ReportRequest::SampleCount => {
+                            ReportResponse::SampleCount(payload)
+                        }
+                        ReportRequest::MaxLanes => {
+                            ReportResponse::MaxLanes(payload)
+                        }
                     };
                     Ok(MarginResponse::Report(report_response))
                 } else {
@@ -1037,7 +1078,9 @@ impl MarginResponse {
                             ),
                         })
                     } else {
-                        Ok(MarginResponse::ErrorCountLimit(ErrorCount::from(payload)))
+                        Ok(MarginResponse::ErrorCountLimit(ErrorCount::from(
+                            payload,
+                        )))
                     }
                 }
             },
@@ -1075,22 +1118,25 @@ impl MarginResponse {
     pub fn payload(&self) -> u8 {
         match self {
             MarginResponse::NoCommand => 0x9C,
-            MarginResponse::Report(ReportResponse::Capabilities(p)) => (*p).into(),
+            MarginResponse::Report(ReportResponse::Capabilities(p)) => {
+                (*p).into()
+            }
             MarginResponse::Report(ReportResponse::NumVoltageSteps(p)) => *p,
             MarginResponse::Report(ReportResponse::NumTimingSteps(p)) => *p,
             MarginResponse::Report(ReportResponse::MaxTimingOffset(p)) => *p,
             MarginResponse::Report(ReportResponse::MaxVoltageOffset(p)) => *p,
-            MarginResponse::Report(ReportResponse::SamplingRateVoltage(p)) => *p,
+            MarginResponse::Report(ReportResponse::SamplingRateVoltage(p)) => {
+                *p
+            }
             MarginResponse::Report(ReportResponse::SamplingRateTiming(p)) => *p,
             MarginResponse::Report(ReportResponse::SampleCount(p)) => *p,
             MarginResponse::Report(ReportResponse::MaxLanes(p)) => *p,
             MarginResponse::ErrorCountLimit(count) => u8::from(*count),
             MarginResponse::GoToNormalSettings => 0x0F,
             MarginResponse::ClearErrorLog => 0x55,
-            MarginResponse::StepExecutionStatus {
-                status,
-                error_count,
-            } => u8::from(*status) | u8::from(*error_count),
+            MarginResponse::StepExecutionStatus { status, error_count } => {
+                u8::from(*status) | u8::from(*error_count)
+            }
             MarginResponse::Empty => 0x00,
         }
     }
@@ -1131,7 +1177,10 @@ pub struct MarginingLaneStatus {
 }
 
 impl MarginingLaneStatus {
-    pub fn decode_for_cmd(cmd: MarginCommand, word: u16) -> Result<Self, Error> {
+    pub fn decode_for_cmd(
+        cmd: MarginCommand,
+        word: u16,
+    ) -> Result<Self, Error> {
         let receiver = Receiver::new((word & 0b111) as u8).unwrap();
         let response = MarginResponse::decode_for_cmd(cmd, word)?;
         Ok(Self { receiver, response })
@@ -1163,7 +1212,9 @@ impl LaneMarginInner {
     }
 
     fn report_capabilities(&self) -> Result<ReportCapabilities, Error> {
-        if let ReportResponse::Capabilities(caps) = self.report(ReportRequest::Capabilities)? {
+        if let ReportResponse::Capabilities(caps) =
+            self.report(ReportRequest::Capabilities)?
+        {
             Ok(caps)
         } else {
             Err(Error::Margin(format!(
@@ -1228,7 +1279,10 @@ impl LaneMarginInner {
         u16::from_le_bytes(words)
     }
 
-    fn wait_for_response(&self, cmd: MarginCommand) -> Result<MarginResponse, Error> {
+    fn wait_for_response(
+        &self,
+        cmd: MarginCommand,
+    ) -> Result<MarginResponse, Error> {
         const WAIT_INTERVAL: Duration = Duration::from_micros(10);
         const MAX_WAIT_TIME: Duration = Duration::from_millis(10);
         let now = Instant::now();
@@ -1273,15 +1327,30 @@ impl LaneMarginInner {
 
     fn write_command(&self, cmd: MarginCommand) -> Result<(), Error> {
         let word = self.build_command(cmd);
-        write_configuration_space(&self.device.file, &self.device.bdf, self.cmd_offset, word)
+        write_configuration_space(
+            &self.device.file,
+            &self.device.bdf,
+            self.cmd_offset,
+            word,
+        )
     }
 
-    fn read_command_response(&self, cmd: MarginCommand) -> Result<MarginResponse, Error> {
-        let word = read_configuration_space(&self.device.file, &self.device.bdf, self.sts_offset)?;
+    fn read_command_response(
+        &self,
+        cmd: MarginCommand,
+    ) -> Result<MarginResponse, Error> {
+        let word = read_configuration_space(
+            &self.device.file,
+            &self.device.bdf,
+            self.sts_offset,
+        )?;
         MarginResponse::decode_for_cmd(cmd, word)
     }
 
-    fn gather_limits(&self, caps: &ReportCapabilities) -> Result<MarginingLimits, Error> {
+    fn gather_limits(
+        &self,
+        caps: &ReportCapabilities,
+    ) -> Result<MarginingLimits, Error> {
         let num_voltage_steps = if caps.voltage_supported {
             match self.report(ReportRequest::NumVoltageSteps)? {
                 ReportResponse::NumVoltageSteps(steps) => {
@@ -1300,31 +1369,33 @@ impl LaneMarginInner {
             None
         };
 
-        let num_timing_steps = match self.report(ReportRequest::NumTimingSteps)? {
-            ReportResponse::NumTimingSteps(steps) => {
-                self.no_command()?;
-                steps
-            }
-            other => {
-                return Err(Error::Margin(format!(
-                    "Unexpected response requesting NumTimingSteps: {:?}",
-                    other
-                )));
-            }
-        };
+        let num_timing_steps =
+            match self.report(ReportRequest::NumTimingSteps)? {
+                ReportResponse::NumTimingSteps(steps) => {
+                    self.no_command()?;
+                    steps
+                }
+                other => {
+                    return Err(Error::Margin(format!(
+                        "Unexpected response requesting NumTimingSteps: {:?}",
+                        other
+                    )));
+                }
+            };
 
-        let max_timing_offset = match self.report(ReportRequest::MaxTimingOffset)? {
-            ReportResponse::MaxTimingOffset(offset) => {
-                self.no_command()?;
-                offset
-            }
-            other => {
-                return Err(Error::Margin(format!(
-                    "Unexpected response requesting MaxTimingOffset: {:?}",
-                    other
-                )));
-            }
-        };
+        let max_timing_offset =
+            match self.report(ReportRequest::MaxTimingOffset)? {
+                ReportResponse::MaxTimingOffset(offset) => {
+                    self.no_command()?;
+                    offset
+                }
+                other => {
+                    return Err(Error::Margin(format!(
+                        "Unexpected response requesting MaxTimingOffset: {:?}",
+                        other
+                    )));
+                }
+            };
 
         let max_voltage_offset = if caps.voltage_supported {
             match self.report(ReportRequest::MaxVoltageOffset)? {
@@ -1362,18 +1433,19 @@ impl LaneMarginInner {
             None
         };
 
-        let sampling_rate_timing = match self.report(ReportRequest::SamplingRateTiming)? {
-            ReportResponse::SamplingRateTiming(rate) => {
-                self.no_command()?;
-                rate
-            }
-            other => {
-                return Err(Error::Margin(format!(
+        let sampling_rate_timing =
+            match self.report(ReportRequest::SamplingRateTiming)? {
+                ReportResponse::SamplingRateTiming(rate) => {
+                    self.no_command()?;
+                    rate
+                }
+                other => {
+                    return Err(Error::Margin(format!(
                     "Unexpected response requesting SamplingRateTiming: {:?}",
                     other
                 )));
-            }
-        };
+                }
+            };
 
         Ok(MarginingLimits {
             num_voltage_steps,
@@ -1395,7 +1467,9 @@ impl LaneMarginInner {
                 if limit == actual_limit {
                     Ok(())
                 } else {
-                    Err(Error::Margin(format!("Failed to set error count limit")))
+                    Err(Error::Margin(format!(
+                        "Failed to set error count limit"
+                    )))
                 }
             }
             _ => Err(Error::Margin(format!(
@@ -1421,31 +1495,30 @@ impl LaneMarginInner {
         loop {
             let response = self.wait_for_response(cmd)?;
             match response {
-                MarginResponse::StepExecutionStatus {
-                    status,
-                    error_count,
-                } => match status {
-                    StepMarginExecutionStatus::Nak => {
-                        return Err(Error::Margin(format!(
+                MarginResponse::StepExecutionStatus { status, error_count } => {
+                    match status {
+                        StepMarginExecutionStatus::Nak => {
+                            return Err(Error::Margin(format!(
                             "Margin failed, step execution status returned NAK"
                         )));
-                    }
-                    StepMarginExecutionStatus::Setup => {
-                        if now.elapsed() > TOTAL_DURATION {
-                            return Err(Error::Margin(format!(
-                                "Failed to finish margin setup within {:?}",
-                                TOTAL_DURATION,
-                            )));
                         }
-                        sleep(INTERVAL);
-                        continue;
+                        StepMarginExecutionStatus::Setup => {
+                            if now.elapsed() > TOTAL_DURATION {
+                                return Err(Error::Margin(format!(
+                                    "Failed to finish margin setup within {:?}",
+                                    TOTAL_DURATION,
+                                )));
+                            }
+                            sleep(INTERVAL);
+                            continue;
+                        }
+                        StepMarginExecutionStatus::TooManyErrors => {
+                            let result = MarginResult::Failed(error_count);
+                            return Ok((now.elapsed(), result));
+                        }
+                        StepMarginExecutionStatus::InProgress => break,
                     }
-                    StepMarginExecutionStatus::TooManyErrors => {
-                        let result = MarginResult::Failed(error_count);
-                        return Ok((now.elapsed(), result));
-                    }
-                    StepMarginExecutionStatus::InProgress => break,
-                },
+                }
                 _ => {
                     return Err(Error::Margin(format!(
                         "Expected step execution status response, found: {response:?})"
@@ -1518,8 +1591,10 @@ impl LaneMargin {
         let n_lanes = usize::from(u8::from(link_status.width));
         // 2 u16s for each lane (control / status) + 2 for the port capability / status
         let n_bytes = (n_lanes + 1) * std::mem::size_of::<u16>() * 2;
-        let data = device
-            .read_extended_capability_data::<u8>(&ExtendedCapabilityId::LaneMargining, n_bytes)?;
+        let data = device.read_extended_capability_data::<u8>(
+            &ExtendedCapabilityId::LaneMargining,
+            n_bytes,
+        )?;
         let header = LaneMarginingCapabilityHeader::try_from(data.as_slice())?;
         if !header.port_status.ready {
             return Err(Error::Margin(format!(
@@ -1548,11 +1623,7 @@ impl LaneMargin {
         let capabilities = inner.report_capabilities()?;
         inner.no_command()?;
         let limits = inner.gather_limits(&capabilities)?;
-        Ok(Self {
-            inner,
-            capabilities,
-            limits,
-        })
+        Ok(Self { inner, capabilities, limits })
     }
 
     pub fn vendor_id(&self) -> u16 {
@@ -1808,14 +1879,21 @@ pub struct PcieDevice {
 impl PcieDevice {
     /// Construct a PCIe device to operate on a single bus/device/function.
     pub fn new(bdf: Bdf) -> Result<Self, Error> {
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .open(PCI_REG_DEVICE_FILE)?;
-        let vendor_id = read_configuration_space::<u16>(&file, &bdf, PCIE_VENDOR_ID_OFFSET)?;
-        let device_id = read_configuration_space::<u16>(&file, &bdf, PCIE_DEVICE_ID_OFFSET)?;
+        let file =
+            File::options().read(true).write(true).open(PCI_REG_DEVICE_FILE)?;
+        let vendor_id = read_configuration_space::<u16>(
+            &file,
+            &bdf,
+            PCIE_VENDOR_ID_OFFSET,
+        )?;
+        let device_id = read_configuration_space::<u16>(
+            &file,
+            &bdf,
+            PCIE_DEVICE_ID_OFFSET,
+        )?;
         let capabilities = Self::read_capabilities(&file, &bdf)?;
-        let extended_capabilities = Self::read_extended_capabilities(&file, &bdf)?;
+        let extended_capabilities =
+            Self::read_extended_capabilities(&file, &bdf)?;
         Ok(Self {
             vendor_id,
             device_id,
@@ -1831,10 +1909,8 @@ impl PcieDevice {
     /// This is fallible because it opens a new file for operating on the PCIe
     /// registers.
     pub fn try_clone(&self) -> Result<Self, Error> {
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .open(PCI_REG_DEVICE_FILE)?;
+        let file =
+            File::options().read(true).write(true).open(PCI_REG_DEVICE_FILE)?;
         Ok(Self {
             vendor_id: self.vendor_id,
             device_id: self.device_id,
@@ -1861,16 +1937,20 @@ impl PcieDevice {
     }
 
     /// Return `true` if the PCIe extended capability `id` is supported
-    pub fn supports_extended_capability(&self, id: &ExtendedCapabilityId) -> bool {
+    pub fn supports_extended_capability(
+        &self,
+        id: &ExtendedCapabilityId,
+    ) -> bool {
         self.find_extended_capability(id).is_some()
     }
 
     // Return the register offset and capability ID of the requested
     // capability, or `None` if it's not supported by the device
-    fn find_capability(&self, cap: &CapabilityId) -> Option<(&usize, &CapabilityId)> {
-        self.capabilities
-            .iter()
-            .find(|(_, capability)| capability == &cap)
+    fn find_capability(
+        &self,
+        cap: &CapabilityId,
+    ) -> Option<(&usize, &CapabilityId)> {
+        self.capabilities.iter().find(|(_, capability)| capability == &cap)
     }
 
     // Return the register offset and capability ID of the requested
@@ -1885,9 +1965,15 @@ impl PcieDevice {
     }
 
     // Read all the capabilities from configuration space for this device
-    fn read_capabilities(file: &File, bdf: &Bdf) -> Result<BTreeMap<usize, CapabilityId>, Error> {
-        let mut cap_start =
-            usize::from(read_configuration_space::<u8>(file, bdf, PCIE_CAP_POINTER)?);
+    fn read_capabilities(
+        file: &File,
+        bdf: &Bdf,
+    ) -> Result<BTreeMap<usize, CapabilityId>, Error> {
+        let mut cap_start = usize::from(read_configuration_space::<u8>(
+            file,
+            bdf,
+            PCIE_CAP_POINTER,
+        )?);
         assert_ne!(
             cap_start, 0,
             "PCIe devices must implement at least 2 capabilities"
@@ -1966,7 +2052,11 @@ impl PcieDevice {
     }
 }
 
-fn read_configuration_space<W>(file: &File, bdf: &Bdf, offset: usize) -> Result<W, Error>
+fn read_configuration_space<W>(
+    file: &File,
+    bdf: &Bdf,
+    offset: usize,
+) -> Result<W, Error>
 where
     W: DataWord,
 {
@@ -2000,7 +2090,12 @@ where
     }
 }
 
-fn write_configuration_space<W>(file: &File, bdf: &Bdf, offset: usize, word: W) -> Result<(), Error>
+fn write_configuration_space<W>(
+    file: &File,
+    bdf: &Bdf,
+    offset: usize,
+    word: W,
+) -> Result<(), Error>
 where
     W: DataWord,
 {
@@ -2066,17 +2161,21 @@ pub enum MarginResult {
     Failed(ErrorCount),
 }
 
-fn write_file_header(outfile: &mut File, device: &PcieDevice, lane: &Lane) -> std::io::Result<()> {
+fn write_file_header(
+    outfile: &mut File,
+    device: &PcieDevice,
+    lane: &Lane,
+) -> std::io::Result<()> {
     writeln!(outfile, "Vendor ID: {:#x}", device.vendor_id)?;
     writeln!(outfile, "Device ID: {:#x}", device.device_id)?;
     writeln!(outfile, "Lane: {}", lane)?;
-    writeln!(
-        outfile,
-        "Time (%UI)\tVoltage (V)\tDuration (s)\tCount\tPass"
-    )
+    writeln!(outfile, "Time (%UI)\tVoltage (V)\tDuration (s)\tCount\tPass")
 }
 
-fn open_margin_results_file(device: &PcieDevice, lane: &Lane) -> anyhow::Result<(File, String)> {
+fn open_margin_results_file(
+    device: &PcieDevice,
+    lane: &Lane,
+) -> anyhow::Result<(File, String)> {
     let filename = format!(
         "margin-results-b{:x}-d{:x}-f{:x}-l{}-{}.txt",
         device.bdf.bus,
@@ -2098,8 +2197,10 @@ fn open_margin_results_file(device: &PcieDevice, lane: &Lane) -> anyhow::Result<
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let device = PcieDevice::new(args.bdf).context("Failed to create PCIe device")?;
-    let link_status = device.link_status().context("Failed to get link status")?;
+    let device =
+        PcieDevice::new(args.bdf).context("Failed to create PCIe device")?;
+    let link_status =
+        device.link_status().context("Failed to get link status")?;
 
     if args.verbose > verbosity::LINK_STATUS {
         println!("lmar: {:#x?}", link_status);
@@ -2147,7 +2248,9 @@ fn main() -> anyhow::Result<()> {
         // All margining threads will send us this report of
         // capabilities. Let's only print one of them.
         let limits = margin.limits();
-        if !printed_caps && (args.verbose >= verbosity::CAPABILITIES || args.report_only) {
+        if !printed_caps
+            && (args.verbose >= verbosity::CAPABILITIES || args.report_only)
+        {
             let capabilities = margin.capabilities();
             println!("lmar: {capabilities:#?}");
             println!("lmar: {limits:#?}");
@@ -2164,7 +2267,9 @@ fn main() -> anyhow::Result<()> {
 
         // Spawn a thread for actually running the protocol.
         let (file, filename) = open_margin_results_file(&device, &lane)?;
-        let thr = thread::spawn(move || margin_lane(margin, duration, args.error_count, tx_));
+        let thr = thread::spawn(move || {
+            margin_lane(margin, duration, args.error_count, tx_)
+        });
         if args.verbose >= verbosity::FILENAME {
             println!("lmar: saving lane {} to \"{}\"", lane, filename);
         }
@@ -2176,7 +2281,8 @@ fn main() -> anyhow::Result<()> {
         // Setup the progress bars for this lane, if the verbosity level
         // requires it.
         let bars = if args.verbose == verbosity::PROGRESS_SUMMARY {
-            let bars = ProgressBars::new(&lane, margining_limits.as_ref().unwrap());
+            let bars =
+                ProgressBars::new(&lane, margining_limits.as_ref().unwrap());
             let mp = progress.as_ref().expect("No progress bars!");
             mp.add(bars.time.clone());
             if let Some(vb) = bars.voltage.as_ref() {
@@ -2188,15 +2294,7 @@ fn main() -> anyhow::Result<()> {
         };
 
         // Store the state for this lane's margin worker.
-        state.insert(
-            lane,
-            MarginState {
-                thr,
-                file,
-                n_points: (0, 0),
-                bars,
-            },
-        );
+        state.insert(lane, MarginState { thr, file, n_points: (0, 0), bars });
     }
 
     // Unhide the progress bars, and tick them all manually so that they draw to
@@ -2219,29 +2317,29 @@ fn main() -> anyhow::Result<()> {
     // per-thread senders are closed.
     drop(tx);
     while let Ok(update) = rx.recv() {
-        let st = state
-            .get_mut(&update.lane)
-            .expect("No margining state for lane");
+        let st =
+            state.get_mut(&update.lane).expect("No margining state for lane");
         let limits = margining_limits
             .as_ref()
             .expect("Limits should be reported before margining starts");
 
         // Update the number of points we've margined for this lane, and
         // get the total we expect based on the reported capabilities.
-        let (n_points, n_total_points) = if matches!(update.point, MarginPoint::Time(_)) {
-            st.n_points.0 += 1;
-            (st.n_points.0, limits.num_timing_steps * 2)
-        } else {
-            st.n_points.1 += 1;
-            (
-                st.n_points.1,
-                limits.num_voltage_steps.expect(
-                    "Received margin update for voltage for a \
+        let (n_points, n_total_points) =
+            if matches!(update.point, MarginPoint::Time(_)) {
+                st.n_points.0 += 1;
+                (st.n_points.0, limits.num_timing_steps * 2)
+            } else {
+                st.n_points.1 += 1;
+                (
+                    st.n_points.1,
+                    limits.num_voltage_steps.expect(
+                        "Received margin update for voltage for a \
                     device that doesn't appear to support \
                     voltage margining",
-                ) * 2,
-            )
-        };
+                    ) * 2,
+                )
+            };
 
         // Write the result to the output file.
         let (pass, count) = match update.result {
@@ -2325,7 +2423,10 @@ impl ProgressBars {
             Some(u64::from(limits.num_timing_steps) * 2),
             ProgressDrawTarget::hidden(),
         );
-        time.set_style(ProgressStyle::with_template("{prefix:24}: {bar} {pos} / {len}").unwrap());
+        time.set_style(
+            ProgressStyle::with_template("{prefix:24}: {bar} {pos} / {len}")
+                .unwrap(),
+        );
         time.set_prefix(format!("lmar: lane {lane} (time)"));
         time.tick();
         let voltage = limits.num_voltage_steps.map(|n_steps| {
@@ -2334,7 +2435,10 @@ impl ProgressBars {
                 ProgressDrawTarget::hidden(),
             );
             voltage.set_style(
-                ProgressStyle::with_template("{prefix:24}: {bar} {pos} / {len}").unwrap(),
+                ProgressStyle::with_template(
+                    "{prefix:24}: {bar} {pos} / {len}",
+                )
+                .unwrap(),
             );
             voltage.set_prefix(format!("lmar: lane {lane} (voltage)"));
             voltage.tick();
@@ -2373,8 +2477,8 @@ fn margin_lane(
     }
 
     // Compute the resolution in both dimensions.
-    let timing_resolution: f64 =
-        f64::from(limits.max_timing_offset) / f64::from(limits.num_timing_steps);
+    let timing_resolution: f64 = f64::from(limits.max_timing_offset)
+        / f64::from(limits.num_timing_steps);
     let voltage_resolution: f64 = if capabilities.voltage_supported {
         (f64::from(limits.max_voltage_offset.unwrap())
             / f64::from(limits.num_voltage_steps.unwrap()))
@@ -2398,7 +2502,9 @@ fn margin_lane(
         } else {
             1.0
         };
-        let point = MarginPoint::Time(sign * timing_resolution * f64::from(step.steps.0));
+        let point = MarginPoint::Time(
+            sign * timing_resolution * f64::from(step.steps.0),
+        );
         let (margin_duration, result) = margin
             .margin_at_left_right(step, duration)
             .context(format!("Failed to margin point: {step:?}"))?;
@@ -2424,7 +2530,9 @@ fn margin_lane(
         } else {
             1.0
         };
-        let point = MarginPoint::Voltage(sign * voltage_resolution * f64::from(step.steps.0));
+        let point = MarginPoint::Voltage(
+            sign * voltage_resolution * f64::from(step.steps.0),
+        );
         let (margin_duration, result) = margin
             .margin_at_up_down(step, duration)
             .context(format!("Failed to margin point: {step:?}"))?;
