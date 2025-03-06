@@ -1,6 +1,6 @@
 # lmar
 
-Prototype PCIe Lane Margining at the Receiver for illumos systems.
+PCIe Lane Margining at the Receiver for illumos systems.
 
 ## Overview
 
