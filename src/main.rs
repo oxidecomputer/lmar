@@ -2,12 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! PCIe lane margining at the receiver prototype.
+//! PCIe lane margining at the receiver
 
-use anyhow::ensure;
-use anyhow::Context;
+use anyhow::{ensure, Context, Result};
 use clap::ArgAction;
 use clap::ArgEnum;
+use clap::Error as ClapError;
+use clap::ErrorKind;
 use clap::Parser;
 use indicatif::MultiProgress;
 use indicatif::ProgressBar;
@@ -16,17 +17,26 @@ use indicatif::ProgressStyle;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fmt;
+use std::fs;
 use std::fs::File;
 use std::io;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::num::NonZeroU8;
 use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 use std::time::Instant;
 use thiserror::Error;
+use walkdir::WalkDir;
+use zip::write::SimpleFileOptions;
+use zip::ZipWriter;
+
+const NVMEADM: &str = "/usr/sbin/nvmeadm";
+const PCIEADM: &str = "/usr/lib/pci/pcieadm";
 
 #[derive(Copy, Clone, Debug, ArgEnum)]
 enum Port {
@@ -123,14 +133,14 @@ struct Args {
     /// The bus/device/function to run the protocol against.
     ///
     /// Note that values are provided in hexadecimal.
-    bdf: Bdf,
+    bdf: Option<Bdf>,
 
     /// Which port to use on the chosen PCIe endpoint.
     ///
     /// For example, for the root component this should always be downstream.
     /// For an endpoint like a drive, this should be upstream.
     #[clap(arg_enum)]
-    port: Port,
+    port: Option<Port>,
 
     /// The time to spend margining each point, in seconds.
     #[clap(short, long, default_value_t = 1.0)]
@@ -163,6 +173,10 @@ struct Args {
     /// actually run the margining protocol.
     #[clap(short, long)]
     report_only: bool,
+
+    /// Probe for PCIe devices
+    #[clap(short, long)]
+    probe: bool,
 
     /// Don't run Timing margining.
     #[clap(long = "no-timing", action = ArgAction::SetFalse)]
@@ -407,6 +421,20 @@ impl TryFrom<u8> for LinkSpeed {
     }
 }
 
+impl fmt::Display for LinkSpeed {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = match self {
+            LinkSpeed(2.5) => "Gen1",
+            LinkSpeed(5.0) => "Gen2",
+            LinkSpeed(8.0) => "Gen3",
+            LinkSpeed(16.0) => "Gen4",
+            LinkSpeed(32.0) => "Gen5",
+            _ => &format!("{:?}", self),
+        };
+        write!(f, "{}", s)
+    }
+}
+
 /// The PCIe Link Status Register
 #[derive(Debug, Clone, Copy)]
 pub struct LinkStatus {
@@ -435,6 +463,12 @@ impl TryFrom<u16> for LinkStatus {
         let training = (word & (1 << 11)) != 0;
         let active = (word & (1 << 13)) != 0;
         Ok(Self { speed, width, training, active })
+    }
+}
+
+impl fmt::Display for LinkStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}{}", self.speed, self.width)
     }
 }
 
@@ -1783,6 +1817,12 @@ impl std::str::FromStr for Bdf {
     }
 }
 
+impl fmt::Display for Bdf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:x}/{:x}/{:x}", self.bus, self.device, self.function)
+    }
+}
+
 /// The PCI Base Address Register
 #[derive(Debug, Clone, Copy)]
 enum Bar {
@@ -1934,6 +1974,29 @@ impl PcieDevice {
             extended_capabilities: self.extended_capabilities.clone(),
             file,
         })
+    }
+
+    pub fn from_node(n: &devinfo::Node) -> Option<Self> {
+        let mut pw = n.props();
+
+        while let Some(p) = pw.next().transpose().ok()? {
+            match p.name().as_str() {
+                "reg" => {
+                    if let Some(v) = p.as_i32() {
+                        let uv = v as u32;
+                        return Self::new(Bdf {
+                            bus: ((uv & 0xff0000) >> 16) as u8,
+                            device: ((uv & 0xf800) >> 11) as u8,
+                            function: ((uv & 0x700) >> 8) as u8,
+                        })
+                        .ok();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
     }
 
     /// Return the PCIe capabilities for this device
@@ -2140,6 +2203,117 @@ where
     }
 }
 
+#[derive(Debug)]
+pub struct PcieNode {
+    device: PcieDevice,
+    driver: Option<String>,
+    instance: Option<i32>,
+    margin: bool,
+}
+
+#[derive(Debug)]
+pub struct PcieBridge {
+    pub bridge: PcieNode,
+    pub children: Vec<PcieNode>,
+}
+
+impl PcieNode {
+    pub fn new(
+        device: PcieDevice,
+        driver: Option<String>,
+        instance: Option<i32>,
+    ) -> Self {
+        let margin = device
+            .read_extended_capability_data::<u8>(
+                &ExtendedCapabilityId::LaneMargining,
+                8,
+            )
+            .ok()
+            .and_then(|data| {
+                LaneMarginingCapabilityHeader::try_from(data.as_slice()).ok()
+            })
+            .map(|h| h.port_status.ready)
+            .unwrap_or(false);
+        Self { device, driver, instance, margin }
+    }
+}
+
+impl fmt::Display for PcieNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}] {}{} -- {:#x} {:#x} -- {}{}",
+            self.device.bdf,
+            self.driver.clone().unwrap_or("??".to_string()),
+            self.instance.unwrap_or(-1),
+            self.device.vendor_id,
+            self.device.device_id,
+            self.device.link_status().expect("could not retrieve link status"),
+            if self.margin { "  SUPPORTED" } else { "" }
+        )
+    }
+}
+
+impl PcieBridge {
+    pub fn new(
+        device: PcieDevice,
+        driver: Option<String>,
+        instance: Option<i32>,
+    ) -> Self {
+        Self {
+            bridge: PcieNode::new(device, driver, instance),
+            children: vec![],
+        }
+    }
+}
+
+fn enum_pcie_devices() -> Result<Vec<PcieBridge>> {
+    let mut di = devinfo::DevInfo::new()?;
+    let mut w = di.walk_driver("pcieb");
+    let mut bridges: Vec<PcieBridge> = vec![];
+
+    while let Some(n) = w.next().transpose()? {
+        if let Some(dev) = PcieDevice::from_node(&n) {
+            if !matches!(dev.link_status(), Ok(l) if l.active) {
+                continue;
+            }
+            let mut bridge =
+                PcieBridge::new(dev, n.driver_name(), n.instance());
+
+            let mut cdi = devinfo::DevInfo::new()?;
+            let mut childwalk = cdi.walk_node();
+            if let Ok(path) = n.devfs_path() {
+                while let Some(c) = childwalk.next().transpose()? {
+                    match c.parent()? {
+                        Some(parent)
+                            if parent
+                                .devfs_path()
+                                .unwrap_or("".to_string())
+                                == path =>
+                        {
+                            if let Some(cdev) = PcieDevice::from_node(&c) {
+                                if cdev.vendor_id != 0x1022 {
+                                    bridge.children.push(PcieNode::new(
+                                        cdev,
+                                        c.driver_name(),
+                                        c.instance(),
+                                    ));
+                                }
+                            }
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+
+            if bridge.children.len() > 0 {
+                bridges.push(bridge);
+            }
+        }
+    }
+    Ok(bridges)
+}
+
 /// A point at which the margining protocol was run.
 #[derive(Debug, Clone, Copy)]
 pub enum MarginPoint {
@@ -2188,32 +2362,243 @@ fn write_file_header(
 }
 
 fn open_margin_results_file(
+    dir: Option<&str>,
     device: &PcieDevice,
     lane: &Lane,
 ) -> anyhow::Result<(File, String)> {
-    let filename = format!(
-        "margin-results-b{:x}-d{:x}-f{:x}-l{}-{}.txt",
-        device.bdf.bus,
-        device.bdf.device,
-        device.bdf.function,
-        lane,
-        chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S"),
+    let mut filename = format!(
+        "margin-results-b{:x}-d{:x}-f{:x}-l{}",
+        device.bdf.bus, device.bdf.device, device.bdf.function, lane,
     );
+
+    if dir.is_none() {
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S");
+        filename.push_str(&format!("{timestamp}.txt"));
+    }
+
+    let path: PathBuf = match dir {
+        Some(d) => Path::new(d).join(&filename),
+        None => PathBuf::from(&filename),
+    };
+
     let mut outfile = File::options()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(&filename)
-        .context("Failed to create output file")?;
+        .open(&path)
+        .with_context(|| {
+            format!("Failed to create output file at {}", path.display())
+        })?;
     write_file_header(&mut outfile, device, lane)?;
-    Ok((outfile, filename))
+    Ok((outfile, path.display().to_string()))
+}
+
+pub trait OutputExt {
+    fn info(&self) -> String;
+}
+
+impl OutputExt for std::process::Output {
+    fn info(&self) -> String {
+        let mut out = String::new();
+
+        if let Some(code) = self.status.code() {
+            out.push_str(&format!("exit code {}", code));
+        }
+
+        let stderr = String::from_utf8_lossy(&self.stderr).trim().to_string();
+        let extra = if stderr.is_empty() {
+            String::from_utf8_lossy(&self.stdout).trim().to_string()
+        } else {
+            stderr
+        };
+
+        if !extra.is_empty() {
+            if !out.is_empty() {
+                out.push_str(": ");
+            }
+            out.push_str(&extra);
+        }
+
+        out
+    }
+}
+
+fn margin_one(
+    args: &Args,
+    dir: &PathBuf,
+    node: &PcieNode,
+    port: Port,
+) -> Result<()> {
+    if !node.margin {
+        return Ok(());
+    }
+
+    println!("Margining {}", node);
+
+    let suffix = format!(
+        "{}{}-b{:x}-d{:x}-f{:x}",
+        node.driver.clone().unwrap_or("unknown".to_string()),
+        node.instance.unwrap_or(-1),
+        node.device.bdf.bus,
+        node.device.bdf.device,
+        node.device.bdf.function
+    );
+
+    // Save the config space
+    let mut of = dir.clone();
+    of.push(&format!("cfgspace-{suffix}"));
+    let out = Command::new(PCIEADM)
+        .env_clear()
+        .arg("save-cfgspace")
+        .arg("-d")
+        .arg(&format!("{}", node.device.bdf))
+        .arg(of)
+        .output()?;
+    if !out.status.success() {
+        println!(
+            "`pcieadm save-cfgspace` for {} failed with: {}",
+            node.device.bdf,
+            out.info()
+        );
+    }
+
+    // Save information for NVMe devices
+    if node.driver.as_deref() == Some("nvme") {
+        let out = Command::new(NVMEADM)
+            .env_clear()
+            .arg("identify")
+            .arg(&format!("nvme{}", node.instance.expect("instance not set")))
+            .output()?;
+        if !out.status.success() {
+            println!(
+                "`nvmeadm identify` for {} failed with: {}",
+                node.device.bdf,
+                out.info()
+            );
+        } else {
+            let mut f = dir.clone();
+            f.push(&format!("nvmeinfo-{suffix}"));
+            let mut file = File::create(f)?;
+            file.write_all(&out.stdout)?;
+        }
+    }
+
+    let link_status =
+        node.device.link_status().context("Failed to get link status")?;
+    let lanes = LaneDescription::All.to_indices(&link_status)?;
+    let receiver = match port {
+        Port::Upstream => Receiver::upstream(),
+        Port::Downstream => Receiver::downstream(),
+    };
+
+    run_margin(dir.to_str(), &node.device, lanes, receiver, args)
+}
+
+fn zip_dir(src_dir: &Path, dst_file: &Path) -> anyhow::Result<()> {
+    let file = File::create(dst_file)?;
+    let mut zip = ZipWriter::new(file);
+
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let src_dir = src_dir.canonicalize()?;
+    let top = src_dir.file_name().unwrap_or_default();
+
+    for entry in WalkDir::new(&src_dir) {
+        let entry = entry?;
+        let path = entry.path();
+        let rel_path = path.strip_prefix(&src_dir)?;
+        let name = Path::new(top).join(rel_path);
+
+        if path.is_file() {
+            let mut f = File::open(path)?;
+            let mut buffer = Vec::new();
+            f.read_to_end(&mut buffer)?;
+
+            zip.start_file(name.to_string_lossy(), options)?;
+            zip.write_all(&buffer)?;
+        } else if path.is_dir() {
+            zip.add_directory(name.to_string_lossy(), options)?;
+        }
+    }
+
+    zip.finish()?;
+    Ok(())
+}
+
+fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
+    let dirname =
+        format!("margin-{}", chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S"));
+    fs::create_dir(&dirname).context("Failed to create output directory")?;
+
+    let dir = PathBuf::from(&dirname);
+
+    let devs = Command::new(PCIEADM).env_clear().arg("show-devs").output()?;
+    let mut f = dir.clone();
+    f.push("dev.list");
+    let mut file = File::create(f)?;
+    file.write_all(&devs.stdout)?;
+
+    let devs = Command::new(PCIEADM)
+        .env_clear()
+        .arg("show-devs")
+        .arg("-o")
+        .arg("bdf,instance,vid,did,path")
+        .arg("nvme")
+        .output()?;
+    let mut f = dir.clone();
+    f.push("nvme.list");
+    let mut file = File::create(f)?;
+    file.write_all(&devs.stdout)?;
+
+    for b in &bridges {
+        for c in &b.children {
+            margin_one(&args, &dir, c, Port::Upstream)?;
+        }
+        margin_one(&args, &dir, &b.bridge, Port::Downstream)?;
+    }
+
+    let zipfile = PathBuf::from(&dir).with_extension("zip");
+    zip_dir(&dir, &zipfile)?;
+
+    println!("Created {}", zipfile.display());
+
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let device =
-        PcieDevice::new(args.bdf).context("Failed to create PCIe device")?;
+    if args.probe {
+        let bridges = enum_pcie_devices()?;
+
+        for b in &bridges {
+            println!("{}", b.bridge);
+
+            for c in &b.children {
+                println!("    {}", c);
+            }
+        }
+        if !args.report_only {
+            println!("---");
+            margin_all(args, bridges)?;
+        }
+        return Ok(());
+    }
+
+    let device = match args.bdf {
+        Some(bdf) => {
+            PcieDevice::new(bdf).context("Failed to create PCIe device")?
+        }
+        None => {
+            return Err(ClapError::raw(
+                ErrorKind::MissingRequiredArgument,
+                "<BDF> is required in this context",
+            )
+            .into());
+        }
+    };
+
     let link_status =
         device.link_status().context("Failed to get link status")?;
 
@@ -2221,19 +2606,38 @@ fn main() -> anyhow::Result<()> {
         println!("lmar: {:#x?}", link_status);
     }
 
-    let duration = Duration::from_secs_f64(args.duration.max(0.200));
-    if args.verbose >= verbosity::MARGIN_DURATION {
-        println!("lmar: margin duration {:?}", duration);
-    }
-
     let receiver = match args.port {
-        Port::Upstream => Receiver::upstream(),
-        Port::Downstream => Receiver::downstream(),
+        Some(Port::Upstream) => Receiver::upstream(),
+        Some(Port::Downstream) => Receiver::downstream(),
+        _ => {
+            return Err(ClapError::raw(
+                ErrorKind::MissingRequiredArgument,
+                "<PORT> is required in this context",
+            )
+            .into());
+        }
     };
 
     let lanes = args.lanes.to_indices(&link_status)?;
     if args.verbose >= verbosity::PROGRESS_SUMMARY {
         println!("lmar: margining lanes: {lanes:?}");
+    }
+
+    run_margin(None, &device, lanes, receiver, &args)?;
+
+    Ok(())
+}
+
+fn run_margin(
+    dir: Option<&str>,
+    device: &PcieDevice,
+    lanes: Vec<Lane>,
+    receiver: Receiver,
+    args: &Args,
+) -> Result<()> {
+    let duration = Duration::from_secs_f64(args.duration.max(0.200));
+    if args.verbose >= verbosity::MARGIN_DURATION {
+        println!("lmar: margin duration {:?}", duration);
     }
 
     // Each lane will be margined in a thread, and will send updates to the main
@@ -2281,16 +2685,12 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Spawn a thread for actually running the protocol.
-        let (file, filename) = open_margin_results_file(&device, &lane)?;
+        let (file, filename) = open_margin_results_file(dir, device, &lane)?;
+        let error_count = args.error_count;
+        let timing = args.timing;
+        let voltage = args.voltage;
         let thr = thread::spawn(move || {
-            margin_lane(
-                margin,
-                duration,
-                args.error_count,
-                args.timing,
-                args.voltage,
-                tx_,
-            )
+            margin_lane(margin, duration, error_count, timing, voltage, tx_)
         });
         if args.verbose >= verbosity::FILENAME {
             println!("lmar: saving lane {} to \"{}\"", lane, filename);
@@ -2545,9 +2945,7 @@ fn margin_lane(
     // Iterate over the voltage steps, if supported.
     if voltage {
         let steps = margin.iter_up_down_steps();
-        println!("Steps: {:?}", steps);
         for step in steps.into_iter() {
-            println!("Step: {:?}", step);
             // Set up per the spec for margining a single point.
             margin.clear_error_log()?;
             margin.go_to_normal_settings()?;
