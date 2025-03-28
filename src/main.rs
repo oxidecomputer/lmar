@@ -6,6 +6,7 @@
 
 use anyhow::ensure;
 use anyhow::Context;
+use clap::ArgAction;
 use clap::ArgEnum;
 use clap::Parser;
 use indicatif::MultiProgress;
@@ -162,6 +163,20 @@ struct Args {
     /// actually run the margining protocol.
     #[clap(short, long)]
     report_only: bool,
+
+    /// Don't run Timing margining.
+    #[clap(long = "no-timing", action = ArgAction::SetFalse)]
+    timing: bool,
+    /// Run timing margining [default].
+    #[clap(long = "timing", overrides_with = "timing")]
+    _no_timing: bool,
+
+    /// Don't run Voltage margining.
+    #[clap(long = "no-voltage", action = ArgAction::SetFalse)]
+    voltage: bool,
+    /// Run Voltage margining if supported [default].
+    #[clap(long = "voltage", overrides_with = "voltage")]
+    _no_voltage: bool,
 }
 
 /// Errors working with a PCIe device
@@ -2268,7 +2283,14 @@ fn main() -> anyhow::Result<()> {
         // Spawn a thread for actually running the protocol.
         let (file, filename) = open_margin_results_file(&device, &lane)?;
         let thr = thread::spawn(move || {
-            margin_lane(margin, duration, args.error_count, tx_)
+            margin_lane(
+                margin,
+                duration,
+                args.error_count,
+                args.timing,
+                args.voltage,
+                tx_,
+            )
         });
         if args.verbose >= verbosity::FILENAME {
             println!("lmar: saving lane {} to \"{}\"", lane, filename);
@@ -2278,7 +2300,7 @@ fn main() -> anyhow::Result<()> {
         // necessary, but may help improve throughput a bit.
         thread::sleep(duration / lanes.len() as u32);
 
-        // Setup the progress bars for this lane, if the verbosity level
+        // Set up the progress bars for this lane, if the verbosity level
         // requires it.
         let bars = if args.verbose == verbosity::PROGRESS_SUMMARY {
             let bars =
@@ -2465,6 +2487,8 @@ fn margin_lane(
     margin: LaneMargin,
     duration: Duration,
     error_count: Option<u8>,
+    timing: bool,
+    voltage: bool,
     tx: mpsc::Sender<MarginUpdate>,
 ) -> anyhow::Result<()> {
     let lane = margin.lane();
@@ -2488,60 +2512,66 @@ fn margin_lane(
     };
 
     // Iterate over the timing steps from left to right.
-    let steps = margin.iter_left_right_steps();
-    for step in steps.into_iter() {
-        // Setup per the spec for margining a single point.
-        margin.clear_error_log()?;
-        margin.go_to_normal_settings()?;
-        margin.no_command()?;
+    if timing {
+        let steps = margin.iter_left_right_steps();
+        for step in steps.into_iter() {
+            // Set up per the spec for margining a single point.
+            margin.clear_error_log()?;
+            margin.go_to_normal_settings()?;
+            margin.no_command()?;
 
-        // Compute the actual time as a percentage of UI that we're currently
-        // margining.
-        let sign = if matches!(step.direction, Some(LeftRight::Left)) {
-            -1.0
-        } else {
-            1.0
-        };
-        let point = MarginPoint::Time(
-            sign * timing_resolution * f64::from(step.steps.0),
-        );
-        let (margin_duration, result) = margin
-            .margin_at_left_right(step, duration)
-            .context(format!("Failed to margin point: {step:?}"))?;
-        tx.send(MarginUpdate {
-            lane,
-            point,
-            duration: margin_duration,
-            result,
-        })?;
+            // Compute the actual time as a percentage of UI that we're currently
+            // margining.
+            let sign = if matches!(step.direction, Some(LeftRight::Left)) {
+                -1.0
+            } else {
+                1.0
+            };
+            let point = MarginPoint::Time(
+                sign * timing_resolution * f64::from(step.steps.0),
+            );
+            let (margin_duration, result) = margin
+                .margin_at_left_right(step, duration)
+                .context(format!("Failed to margin point: {step:?}"))?;
+            tx.send(MarginUpdate {
+                lane,
+                point,
+                duration: margin_duration,
+                result,
+            })?;
+        }
     }
 
     // Iterate over the voltage steps, if supported.
-    let steps = margin.iter_up_down_steps();
-    for step in steps.into_iter() {
-        // Setup per the spec for margining a single point.
-        margin.clear_error_log()?;
-        margin.go_to_normal_settings()?;
-        margin.no_command()?;
+    if voltage {
+        let steps = margin.iter_up_down_steps();
+        println!("Steps: {:?}", steps);
+        for step in steps.into_iter() {
+            println!("Step: {:?}", step);
+            // Set up per the spec for margining a single point.
+            margin.clear_error_log()?;
+            margin.go_to_normal_settings()?;
+            margin.no_command()?;
 
-        // Compute the actual voltage at which we're margining.
-        let sign = if matches!(step.direction, Some(UpDown::Down)) {
-            -1.0
-        } else {
-            1.0
-        };
-        let point = MarginPoint::Voltage(
-            sign * voltage_resolution * f64::from(step.steps.0),
-        );
-        let (margin_duration, result) = margin
-            .margin_at_up_down(step, duration)
-            .context(format!("Failed to margin point: {step:?}"))?;
-        tx.send(MarginUpdate {
-            lane,
-            point,
-            duration: margin_duration,
-            result,
-        })?;
+            // Compute the actual voltage at which we're margining.
+            let sign = if matches!(step.direction, Some(UpDown::Down)) {
+                -1.0
+            } else {
+                1.0
+            };
+            let point = MarginPoint::Voltage(
+                sign * voltage_resolution * f64::from(step.steps.0),
+            );
+            let (margin_duration, result) = margin
+                .margin_at_up_down(step, duration)
+                .context(format!("Failed to margin point: {step:?}"))?;
+            tx.send(MarginUpdate {
+                lane,
+                point,
+                duration: margin_duration,
+                result,
+            })?;
+        }
     }
 
     Ok(())
