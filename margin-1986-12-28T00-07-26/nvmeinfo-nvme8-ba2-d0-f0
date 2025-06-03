@@ -1,0 +1,109 @@
+nvme8: Identify Controller
+  Controller Capabilities and Features
+    Model:                                  KIOXIA KCD81PUG1T92
+    Serial:                                 XDR0A0520UU1
+    Firmware Revision:                      1XET6102
+    Multi-Interface Capabilities
+      Multiple PCI Express ports:           unsupported
+      Multiple Controller Support:          supported
+      Controller is an SR-IOV Virtual Function: unsupported
+      Asymmetric Namespace Access Reporting: unsupported
+    Maximum Data Transfer Size:             4096kB
+    Unique Controller Identifier:           1
+    NVMe Version:                           2.0
+    RTD3 Resume Latency:                    15000000us
+    RTD3 Entry Latency:                     10000000us
+    Controller Type:                        I/O
+    FRU GUID:                               unsupported
+    Command Retry Delay Time 1:             0ms
+    Command Retry Delay Time 2:             0ms
+    Command Retry Delay Time 3:             0ms
+  Admin Command Set Attributes
+    Optional Admin Command Support
+      Security Send & Receive:              supported
+      Format NVM:                           supported
+      Firmware Activate & Download:         supported
+      Namespace Management:                 supported
+      Device Self-test:                     supported
+      Directives:                           unsupported
+      NVME-MI Send and Receive:             supported
+      Virtualization Management:            supported
+      Doorbell Buffer Config:               unsupported
+      Get LBA Status:                       supported
+    Firmware Updates
+      Firmware Slot 1:                      writable
+      No. of Firmware Slots:                3
+      Activate Without Reset:               supported
+  Log Page Attributes
+      Per Namespace SMART/Health info:      unsupported
+      Commands Supported and Effects:       supported
+      Get Log Page Extended Data:           supported
+      Telemetry Log Pages:                  supported
+      Persistent Event Log:                 supported
+    Error Log Page Entries:                 256
+    Number of Power States:                 3
+    Autonomous Power State Transitions:     unsupported
+    Warning Composite Temperature Threshold: 77C
+    Critical Composite Temperature Threshold: 85C
+    Total NVM Capacity:                     1920383410176B
+    Unallocated NVM Capacity:               0B
+    Firmware Update Granularity:            unrestricted
+  NVM Command Set Attributes
+    Number of Namespaces:                   64
+    Optional NVM Command Support
+      Compare:                              supported
+      Write Uncorrectable:                  supported
+      Dataset Management:                   supported
+      Write Zeros:                          supported
+      Save/Select in Get/Set Features:      supported
+      Reservations:                         supported
+      Timestamp Feature:                    supported
+      Verify:                               supported
+    Fused Operation Support
+      Compare and Write:                    supported
+    Format NVM Attributes
+      Per Namespace Format:                 supported
+      Per Namespace Secure Erase:           unsupported
+      Cryptographic Erase:                  unsupported
+    Volatile Write Cache
+      Present:                              no
+    Atomic Write Unit Normal:               65536 blocks
+    Atomic Write Unit Power Fail:           64 blocks
+    Atomic Compare & Write Size:            65536 blocks
+    SGL Support
+      Command Set:                          supported, no restrictions
+      Keyed SGL Block Descriptor:           unsupported
+      SGL Bit Bucket Descriptor:            supported
+      Byte Aligned Contiguous Metadata:     supported
+      SGL Longer than Data Transferred:     supported
+      MPTR with SGL:                        supported
+      SGL Address as Offset:                unsupported
+      Transport SGL Data Block:             unsupported
+    NVMe Subsystem Qualified Name:          nqn.2019-10.com.kioxia:KCD81PUG1T92:XDR0A0520UU1
+    Power State Descriptor 0
+      Maximum Power:                        25W
+      Non-Operational State:                no
+      Entry Latency:                        500000us
+      Exit Latency:                         500000us
+      Relative Read Throughput (0 = best):  0
+      Relative Read Latency (0 = best):     0
+      Relative Write Throughput (0 = best): 0
+      Relative Write Latency (0 = best):    0
+    Power State Descriptor 1
+      Maximum Power:                        18W
+      Non-Operational State:                no
+      Entry Latency:                        500000us
+      Exit Latency:                         500000us
+      Relative Read Throughput (0 = best):  1
+      Relative Read Latency (0 = best):     1
+      Relative Write Throughput (0 = best): 1
+      Relative Write Latency (0 = best):    1
+    Power State Descriptor 2
+      Maximum Power:                        14W
+      Non-Operational State:                no
+      Entry Latency:                        500000us
+      Exit Latency:                         500000us
+      Relative Read Throughput (0 = best):  2
+      Relative Read Latency (0 = best):     2
+      Relative Write Throughput (0 = best): 2
+      Relative Write Latency (0 = best):    2

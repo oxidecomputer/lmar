@@ -71,6 +71,7 @@ def load_results(file: str) -> dict[dict]:
         xlabel="Voltage (V)",
     )
     return dict(
+        filename=file,
         vendor_id=vendor_id,
         device_id=device_id,
         lane=lane,
@@ -127,15 +128,17 @@ def format_plot(results, fig, axes):
 
 def summarize(namespace):
     files = namespace.files
-    table = dict(vendor_id=[], device_id=[], lane=[], time_margin=[], voltage_margin=[])
+    table = dict(file=[], vendor_id=[], device_id=[], lane=[], time_margin=[], voltage_margin=[])
     for file in files:
         results = load_results(file)
+        table["file"].append(results["filename"])
         table["vendor_id"].append("0x{:04x}".format(results["vendor_id"]))
         table["device_id"].append("0x{:04x}".format(results["device_id"]))
         table["lane"].append(results["lane"])
         table["time_margin"].append(compute_margin(results["time"], "time"))
         table["voltage_margin"].append(compute_margin(results["voltage"], "voltage"))
     headers = (
+        "File Name",
         "Vendor ID",
         "Device ID",
         "Lane",

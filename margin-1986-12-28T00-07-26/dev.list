@@ -1,0 +1,119 @@
+BDF     TYPE           INSTANCE       DEVICE
+0/0/0   PCI            amdzen_stub16  Turin Root Complex
+0/0/2   PCI            --             Turin IOMMU
+0/0/3   PCI            --             Turin RCEC
+0/1/0   PCI            --             Turin PCIe Dummy Host Bridge
+0/1/3   PCIe Gen 4x4   pcieb0         Turin GPP Bridge
+2/0/0   PCIe Gen 4x4   nvme0          7450 PRO NVMe SSD
+0/2/0   PCI            --             Turin PCIe Dummy Host Bridge
+0/3/0   PCI            --             Turin PCIe Dummy Host Bridge
+0/4/0   PCI            --             Turin PCIe Dummy Host Bridge
+0/5/0   PCI            --             Turin PCIe Dummy Host Bridge
+0/7/0   PCI            --             Turin PCIe Dummy Host Bridge
+0/7/1   PCIe Gen 5x16  pcieb1         Turin Internal PCIe GPP Bridge to Bus [D:C]
+1/0/0   PCIe Gen 5x16  --             Turin PCIe Dummy Function
+0/14/0  PCI            --             FCH SMBus Controller
+0/14/3  PCI            --             FCH LPC Bridge
+0/18/0  PCI            amdzen_stub17  Turin Data Fabric; Function 0
+0/18/1  PCI            amdzen_stub18  Turin Data Fabric; Function 1
+0/18/2  PCI            amdzen_stub19  Turin Data Fabric; Function 2
+0/18/3  PCI            amdzen_stub20  Turin Data Fabric; Function 3
+0/18/4  PCI            amdzen_stub21  Turin Data Fabric; Function 4
+0/18/5  PCI            amdzen_stub22  Turin Data Fabric; Function 5
+0/18/6  PCI            amdzen_stub23  Turin Data Fabric; Function 6
+0/18/7  PCI            amdzen_stub24  Turin Data Fabric; Function 7
+BDF     TYPE           INSTANCE       DEVICE
+20/0/0  PCI            amdzen_stub25  Turin Root Complex
+20/0/3  PCI            --             Turin RCEC
+20/1/0  PCI            --             Turin PCIe Dummy Host Bridge
+20/1/3  PCIe Gen 5x4   pcieb2         Turin GPP Bridge
+21/0/0  PCIe Gen 5x4   nvme1          FireCuda 540 SSD
+20/2/0  PCI            --             Turin PCIe Dummy Host Bridge
+40/0/0  PCI            amdzen_stub31  Turin Root Complex
+40/0/2  PCI            --             Turin IOMMU
+40/0/3  PCI            --             Turin RCEC
+40/1/0  PCI            --             Turin PCIe Dummy Host Bridge
+40/1/1  PCIe Gen 5x4   pcieb3         Turin GPP Bridge
+43/0/0  PCIe Gen 5x4   nvme2          Unknown device: 0x5302
+40/1/2  PCIe Gen 5x4   pcieb4         Turin GPP Bridge
+44/0/0  PCIe Gen 5x4   nvme3          9550 PRO NVMe SSD
+40/1/3  PCIe Gen 5x4   pcieb5         Turin GPP Bridge
+45/0/0  PCIe Gen 5x4   nvme4          9550 PRO NVMe SSD
+40/2/0  PCI            --             Turin PCIe Dummy Host Bridge
+40/3/0  PCI            --             Turin PCIe Dummy Host Bridge
+40/4/0  PCI            --             Turin PCIe Dummy Host Bridge
+40/5/0  PCI            --             Turin PCIe Dummy Host Bridge
+40/7/0  PCI            --             Turin PCIe Dummy Host Bridge
+40/7/1  PCIe Gen 5x16  pcieb6         Turin Internal PCIe GPP Bridge to Bus [D:C]
+41/0/0  PCIe Gen 5x16  --             Turin PCIe Dummy Function
+BDF     TYPE           INSTANCE       DEVICE
+41/0/2  PCIe Gen 5x16  --             Unknown device: 0x14c0
+41/0/3  PCIe Gen 5x16  --             Secondary vNTB
+41/0/4  PCIe Gen 5x16  --             Turin USB 3.1 xHCI
+41/0/5  PCIe Gen 5x16  --             Turin CCP/ASP
+41/0/6  PCIe Gen 5x16  --             Unknown device: 0x14cb
+41/0/7  PCIe Gen 5x16  --             Unknown device: 0x14cc
+40/7/2  PCIe Gen 5x16  pcieb7         Turin Internal PCIe GPP Bridge to Bus [D:C]
+42/0/0  PCIe Gen 5x16  --             FCH SATA Controller [AHCI mode]
+42/0/1  PCIe Gen 5x16  --             FCH SATA Controller [AHCI mode]
+60/0/0  PCI            amdzen_stub30  Turin Root Complex
+60/0/3  PCI            --             Turin RCEC
+60/1/0  PCI            --             Turin PCIe Dummy Host Bridge
+60/1/1  PCIe Gen 5x4   pcieb8         Turin GPP Bridge
+61/0/0  PCIe Gen 5x4   nvme5          Unknown device: 0x5302
+60/1/2  PCIe Gen 5x4   pcieb9         Turin GPP Bridge
+62/0/0  PCIe Gen 5x4   nvme6          NVMe DC SSD [Atomos Prime]
+60/1/3  PCIe Gen 5x4   pcieb10        Turin GPP Bridge
+63/0/0  PCIe Gen 5x4   nvme7          NVMe DC SSD [Atomos Prime]
+60/2/0  PCI            --             Turin PCIe Dummy Host Bridge
+80/0/0  PCI            amdzen_stub26  Turin Root Complex
+80/0/3  PCI            --             Turin RCEC
+80/1/0  PCI            --             Turin PCIe Dummy Host Bridge
+80/2/0  PCI            --             Turin PCIe Dummy Host Bridge
+BDF     TYPE           INSTANCE       DEVICE
+a0/0/0  PCI            amdzen_stub27  Turin Root Complex
+a0/0/2  PCI            --             Turin IOMMU
+a0/0/3  PCI            --             Turin RCEC
+a0/1/0  PCI            --             Turin PCIe Dummy Host Bridge
+a0/1/1  PCIe Gen 5x4   pcieb11        Turin GPP Bridge
+a2/0/0  PCIe Gen 5x4   nvme8          NVMe SSD Controller CD8P
+a0/1/2  PCIe Gen 5x4   pcieb12        Turin GPP Bridge
+a3/0/0  PCIe Gen 5x4   nvme9          NVMe SSD Controller CD8P
+a0/1/3  PCIe Gen 5x4   pcieb13        Turin GPP Bridge
+a4/0/0  PCIe Gen 5x4   nvme10         Unknown device: 0x2751
+a0/1/4  PCIe Gen 5x4   pcieb14        Turin GPP Bridge
+a5/0/0  PCIe Gen 5x4   nvme11         Unknown device: 0x2751
+a0/2/0  PCI            --             Turin PCIe Dummy Host Bridge
+a0/3/0  PCI            --             Turin PCIe Dummy Host Bridge
+a0/4/0  PCI            --             Turin PCIe Dummy Host Bridge
+a0/5/0  PCI            --             Turin PCIe Dummy Host Bridge
+a0/7/0  PCI            --             Turin PCIe Dummy Host Bridge
+a0/7/1  PCIe Gen 5x16  pcieb15        Turin Internal PCIe GPP Bridge to Bus [D:C]
+a1/0/0  PCIe Gen 5x16  --             Turin PCIe Dummy Function
+a1/0/2  PCIe Gen 5x16  --             Unknown device: 0x14c0
+a1/0/3  PCIe Gen 5x16  --             Secondary vNTB
+a1/0/4  PCIe Gen 5x16  --             Turin USB 3.1 xHCI
+a1/0/5  PCIe Gen 5x16  --             Turin CCP/ASP
+BDF     TYPE           INSTANCE       DEVICE
+a1/0/6  PCIe Gen 5x16  --             Unknown device: 0x14cb
+a1/0/7  PCIe Gen 5x16  --             Unknown device: 0x14cc
+c0/0/0  PCI            amdzen_stub28  Turin Root Complex
+c0/0/3  PCI            --             Turin RCEC
+c0/1/0  PCI            --             Turin PCIe Dummy Host Bridge
+c0/1/1  PCIe Gen 1x8   pcieb16        Turin GPP Bridge
+c0/2/0  PCI            --             Turin PCIe Dummy Host Bridge
+e0/0/0  PCI            amdzen_stub29  Turin Root Complex
+e0/0/2  PCI            --             Turin IOMMU
+e0/0/3  PCI            --             Turin RCEC
+e0/1/0  PCI            --             Turin PCIe Dummy Host Bridge
+e0/1/2  PCIe Gen 1x1   pcieb17        Turin GPP Bridge
+e3/0/0  PCIe Gen 1x1   igb0           I210 Gigabit Network Connection
+e0/2/0  PCI            --             Turin PCIe Dummy Host Bridge
+e0/3/0  PCI            --             Turin PCIe Dummy Host Bridge
+e0/4/0  PCI            --             Turin PCIe Dummy Host Bridge
+e0/5/0  PCI            --             Turin PCIe Dummy Host Bridge
+e0/7/0  PCI            --             Turin PCIe Dummy Host Bridge
+e0/7/1  PCIe Gen 5x16  pcieb18        Turin Internal PCIe GPP Bridge to Bus [D:C]
+e1/0/0  PCIe Gen 5x16  --             Turin PCIe Dummy Function
+e0/7/2  PCIe Gen 5x16  pcieb19        Turin Internal PCIe GPP Bridge to Bus [D:C]
+e2/0/0  PCIe Gen 5x16  --             FCH SATA Controller [AHCI mode]
