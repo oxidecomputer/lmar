@@ -23,24 +23,38 @@ def compute_margin(results, key) -> float:
     if n_passes == len(passed):
         return np.ptp(independent_axis)
 
+    """
+    np.diff compares n to n+1. If they differ, n is marked as true.
+    Assuming a `passed` of something like:
+    [False, False, True, True, False]
+    np.diff would then yield:
+    [False, True, False, True, False]
+    np.where of that then would be
+    [(1,3),]
+    Note that our actual eye is [2,3], but those calculations result
+    in it being [1,3] which is too wide! Thus, we increment the first
+    index to where our eye actually is.
+    """
+    passed_indices = np.where(np.diff(passed))[0]
+    passed_indices[0] = passed_indices[0] + 1
+
     # Try to compute the last - first point at which the margining
     # passed. If there are exactly two such points, then we're done.
-    passed_indices = np.where(np.diff(passed))[0]
     if len(passed_indices) == 2:
-        return independent_axis[passed_indices[1]] - independent_axis[passed_indices[0]]
-
-    # If there are more than 2 such indices, then take the longest
-    # run, i.e., the ones with the largest difference
-    if len(passed_indices) > 2:
+        lower_bound = passed_indices[0]
+        upper_bound = passed_indices[1]
+    elif len(passed_indices) > 2:
+        # If there are more than 2 such indices, then take the longest
+        # run, i.e., the ones with the largest difference
         run_length = np.diff(passed_indices)
         max_run = np.argmax(run_length)
-        return (
-            independent_axis[passed_indices[max_run + 1]]
-            - independent_axis[passed_indices[max_run]]
-        )
+        lower_bound = passed_indices[max_run]
+        upper_bound = passed_indices[max_run + 1]
+    else:
+        # Not sure, hunk a nan in there
+        return np.nan
 
-    # Not sure, hunk a nan in there
-    return np.nan
+    return independent_axis[upper_bound] - independent_axis[lower_bound];
 
 
 def load_results(file: str) -> dict[dict]:
