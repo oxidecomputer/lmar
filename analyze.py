@@ -186,7 +186,7 @@ def plot(namespace):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    subparsers = parser.add_subparsers()
+    subparsers = parser.add_subparsers(dest="command", required=True)
     plot_parser = subparsers.add_parser("plot", help="Plot margining data")
     plot_parser.add_argument(
         "-s",
