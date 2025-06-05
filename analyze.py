@@ -9,8 +9,103 @@ from argparse import ArgumentParser
 import os.path
 import numpy as np
 import matplotlib.pyplot as plt
+import re
 import sys
 
+# This is a temporary aid for annotating the output on Cosmo until
+# we have topology data and can build this dynamically. For reference, here is
+# the current PCI hierarchy on a representative Cosmo:
+#
+# [0/1/3] - Turin GPP Bridge
+#     [2/0/0] - 7450 PRO NVMe SSD (nvme0)
+# [0/7/1] - Turin Internal PCIe GPP Bridge to Bus [D:C]
+#     [1/0/0] - Turin PCIe Dummy Function (--)
+# [20/1/3] - Turin GPP Bridge
+#     [21/0/0] - FireCuda 540 SSD (nvme1)
+# [40/1/1] - Turin GPP Bridge
+#     [43/0/0] - Unknown device: 0x5302 (nvme20)
+# [40/1/2] - Turin GPP Bridge
+#     [44/0/0] - 9550 PRO NVMe SSD (nvme17)
+# [40/1/3] - Turin GPP Bridge
+#     [45/0/0] - Unknown device: 0x2751 (nvme23)
+# [40/7/1] - Turin Internal PCIe GPP Bridge to Bus [D:C]
+#     [41/0/0] - Turin PCIe Dummy Function (--)
+#     [41/0/2] - Unknown device: 0x14c0 (--)
+#     [41/0/3] - Secondary vNTB (--)
+#     [41/0/4] - Turin USB 3.1 xHCI (--)
+#     [41/0/5] - Turin CCP/ASP (--)
+#     [41/0/6] - Unknown device: 0x14cb (--)
+#     [41/0/7] - Unknown device: 0x14cc (--)
+# [40/7/2] - Turin Internal PCIe GPP Bridge to Bus [D:C]
+#     [42/0/0] - FCH SATA Controller [AHCI mode] (--)
+#     [42/0/1] - FCH SATA Controller [AHCI mode] (--)
+# [60/1/1] - Turin GPP Bridge
+#     [61/0/0] - Unknown device: 0x5302 (nvme21)
+# [60/1/2] - Turin GPP Bridge
+#     [62/0/0] - NVMe DC SSD [Atomos Prime] (nvme18)
+# [60/1/3] - Turin GPP Bridge
+#     [63/0/0] - NVMe DC SSD [Atomos Prime] (nvme19)
+# [a0/1/1] - Turin GPP Bridge
+#     [a2/0/0] - NVMe SSD Controller CD8P (nvme12)
+# [a0/1/2] - Turin GPP Bridge
+#     [a3/0/0] - NVMe SSD Controller CD8P (nvme14)
+# [a0/1/3] - Turin GPP Bridge
+#     [a4/0/0] - Unknown device: 0x2751 (nvme13)
+# [a0/1/4] - Turin GPP Bridge
+#     [a5/0/0] - 9550 PRO NVMe SSD (nvme22)
+# [a0/7/1] - Turin Internal PCIe GPP Bridge to Bus [D:C]
+#     [a1/0/0] - Turin PCIe Dummy Function (--)
+#     [a1/0/2] - Unknown device: 0x14c0 (--)
+#     [a1/0/3] - Secondary vNTB (--)
+#     [a1/0/4] - Turin USB 3.1 xHCI (--)
+#     [a1/0/5] - Turin CCP/ASP (--)
+#     [a1/0/6] - Unknown device: 0x14cb (--)
+#     [a1/0/7] - Unknown device: 0x14cc (--)
+# [c0/1/1] - Turin GPP Bridge
+#     [c1/0/0] - T62100-KR Unified Wire Ethernet Controller (--)
+#     [c1/0/1] - T62100-KR Unified Wire Ethernet Controller (--)
+#     [c1/0/2] - T62100-KR Unified Wire Ethernet Controller (--)
+#     [c1/0/3] - T62100-KR Unified Wire Ethernet Controller (--)
+#     [c1/0/4] - T62100-KR Unified Wire Ethernet Controller (t4nex0)
+#     [c1/0/5] - T62100-KR Unified Wire Storage Controller (--)
+#     [c1/0/6] - T62100-KR Unified Wire Storage Controller (--)
+# [e0/1/2] - Turin GPP Bridge
+#     [e3/0/0] - I210 Gigabit Network Connection (igb0)
+# [e0/7/1] - Turin Internal PCIe GPP Bridge to Bus [D:C]
+#     [e1/0/0] - Turin PCIe Dummy Function (--)
+# [e0/7/2] - Turin Internal PCIe GPP Bridge to Bus [D:C]
+#     [e2/0/0] - FCH SATA Controller [AHCI mode] (--)
+
+COSMO_MAP = {
+        (0x00, 0x1, 0x3): "M.2 East(A) bridge",
+            (0x02, 0x0, 0x0): "M.2 East(A)",
+        (0x20, 0x1, 0x3): "M.2 West(B) bridge",
+            (0x21, 0x0, 0x0): "M.2 West(B)",
+        (0x40, 0x1, 0x1): "N9(J) bridge",
+            (0x43, 0x0, 0x0): "N9(J)",
+        (0x40, 0x1, 0x2): "N5(F) bridge",
+            (0x44, 0x0, 0x0): "N5(F)",
+        (0x40, 0x1, 0x3): "N4(E) bridge",
+            (0x45, 0x0, 0x0): "N4(E)",
+        (0x60, 0x1, 0x1): "N8(I) bridge",
+            (0x61, 0x0, 0x0): "N8(I)",
+        (0x60, 0x1, 0x2): "N8(I) bridge",
+            (0x62, 0x0, 0x0): "N8(I)",
+        (0x60, 0x1, 0x3): "N8(I) bridge",
+            (0x63, 0x0, 0x0): "N8(I)",
+        (0xa0, 0x1, 0x1): "N0(A) bridge",
+            (0xa2, 0x0, 0x0): "N0(A)",
+        (0xa0, 0x1, 0x2): "N1(B) bridge",
+            (0xa3, 0x0, 0x0): "N1(B)",
+        (0xa0, 0x1, 0x3): "N2(C) bridge",
+            (0xa4, 0x0, 0x0): "N2(C)",
+        (0xa0, 0x1, 0x4): "N3(D) bridge",
+            (0xa5, 0x0, 0x0): "N3(D)",
+        (0xc0, 0x1, 0x1): "T6 bridge",
+            (0xc1, 0x0, 0x4): "T6",
+        (0xe0, 0x1, 0x2): "Backplane bridge",
+            (0xe3, 0x0, 0x0): "Backplane",
+}
 
 def compute_margin(results, key) -> float:
     passed = results["passed"]
@@ -66,6 +161,13 @@ def load_results(file: str) -> dict[dict]:
         vendor_id = int(f.readline().rstrip().rsplit()[-1], base=16)
         device_id = int(f.readline().rstrip().rsplit()[-1], base=16)
         lane = int(f.readline().rstrip().rsplit()[-1])
+
+        bus = dev = func = 0
+        match = re.search(r"b([0-9a-f]+)-d([0-9a-f]+)-f([0-9a-f]+)", file)
+        if match:
+            bus, dev, func = (int(x, 16) for x in match.groups())
+        descr = COSMO_MAP.get((bus, dev, func), "?")
+
     results = np.loadtxt(file, skiprows=4, delimiter="\t")
     (time, voltage, duration, count, passed) = range(5)
     is_time = results[:, time] != 0
@@ -87,6 +189,8 @@ def load_results(file: str) -> dict[dict]:
     return dict(
         vendor_id=vendor_id,
         device_id=device_id,
+        bus=bus, dev=dev, func=func,
+        descr=descr,
         lane=lane,
         time=time_results,
         voltage=voltage_results,
@@ -131,21 +235,25 @@ def format_plot(results, fig, axes):
     leg.set_draggable(True)
     fig.tight_layout()
     fig.canvas.manager.set_window_title(
-        "Vendor: {:x}, Device: {:x}, Lane {:d}".format(
+            "Vendor: {:x}, Device: {:x}, Lane {:d} -- {:}".format(
             results["vendor_id"],
             results["device_id"],
             results["lane"],
+            results["descr"],
         )
     )
 
 
 def summarize(namespace):
     files = namespace.files
-    table = dict(vendor_id=[], device_id=[], lane=[], time_margin=[], voltage_margin=[])
+    table = dict(vendor_id=[], device_id=[],
+                 lane=[], time_margin=[], voltage_margin=[],
+                 descr=[])
     for file in files:
         results = load_results(file)
         table["vendor_id"].append("0x{:04x}".format(results["vendor_id"]))
         table["device_id"].append("0x{:04x}".format(results["device_id"]))
+        table["descr"].append(results["descr"])
         table["lane"].append(results["lane"])
         table["time_margin"].append(compute_margin(results["time"], "time"))
         table["voltage_margin"].append(compute_margin(results["voltage"], "voltage"))
@@ -155,6 +263,7 @@ def summarize(namespace):
         "Lane",
         "Time margin (% UI)",
         "Voltage margin (V)",
+        "Description",
     )
     print(tabulate(table, headers=headers))
 
