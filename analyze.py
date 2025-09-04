@@ -75,7 +75,7 @@ import sys
 #     [e1/0/0] - Turin PCIe Dummy Function (--)
 # [e0/7/2] - Turin Internal PCIe GPP Bridge to Bus [D:C]
 #     [e2/0/0] - FCH SATA Controller [AHCI mode] (--)
-
+#
 COSMO_MAP = {
         (0x00, 0x1, 0x3): "M.2 East(A) bridge",
             (0x02, 0x0, 0x0): "M.2 East(A)",
@@ -108,48 +108,57 @@ COSMO_MAP = {
 }
 
 def compute_margin(results, key) -> float:
-    passed = results["passed"]
-    independent_axis = results[key]
+    """
+    Robust margin finder:
+    - Prefers the contiguous PASS run centered around 0 on the independent axis.
+    - If the center sample is FAIL, uses the PASS run nearest to center.
+    - Ignores stray PASS islands at the window edges.
+    """
+    passed = np.asarray(results["passed"], dtype=bool)
+    independent_axis = np.asarray(results[key])
+    n_points = len(passed)
 
-    # First, handle the cases when there are no passes or no failures
-    n_passes = np.sum(passed)
+    if n_points == 0:
+        return np.nan
+    n_passes = int(np.sum(passed))
     if n_passes == 0:
         return 0.0
-    if n_passes == len(passed):
-        return np.ptp(independent_axis)
+    if n_passes == n_points:
+        return float(np.ptp(independent_axis))
 
-    """
-    np.diff compares n to n+1. If they differ, n is marked as true.
-    Assuming a `passed` of something like:
-    [False, False, True, True, False]
-    np.diff would then yield:
-    [False, True, False, True, False]
-    np.where of that then would be
-    [(1,3),]
-    Note that our actual eye is [2,3], but those calculations result
-    in it being [1,3] which is too wide! Thus, we increment the first
-    index to where our eye actually is.
-    """
-    passed_indices = np.where(np.diff(passed))[0]
-    passed_indices[0] = passed_indices[0] + 1
+    # Find contiguous PASS runs as (start_idx, end_idx), inclusive.
+    transitions = np.diff(passed.astype(np.int8))
+    run_starts = list(np.where(transitions == 1)[0] + 1)
+    run_ends = list(np.where(transitions == -1)[0])
 
-    # Try to compute the last - first point at which the margining
-    # passed. If there are exactly two such points, then we're done.
-    if len(passed_indices) == 2:
-        lower_bound = passed_indices[0]
-        upper_bound = passed_indices[1]
-    elif len(passed_indices) > 2:
-        # If there are more than 2 such indices, then take the longest
-        # run, i.e., the ones with the largest difference
-        run_length = np.diff(passed_indices)
-        max_run = np.argmax(run_length)
-        lower_bound = passed_indices[max_run]
-        upper_bound = passed_indices[max_run + 1]
-    else:
-        # Not sure, hunk a nan in there
-        return np.nan
+    if passed[0]:
+        run_starts = [0] + run_starts
+    if passed[-1]:
+        run_ends = run_ends + [n_points - 1]
 
-    return independent_axis[upper_bound] - independent_axis[lower_bound];
+    pass_runs = list(zip(run_starts, run_ends))
+    if not pass_runs:
+        return 0.0
+
+    # Index of the point closest to 0 on the sweep axis (the center).
+    center_index = int(np.argmin(np.abs(independent_axis)))
+
+    # Prefer the run that contains the center.
+    for start_idx, end_idx in pass_runs:
+        if start_idx <= center_index <= end_idx:
+            return float(independent_axis[end_idx] - independent_axis[start_idx])
+
+    # Otherwise, choose the run nearest to the center by index distance.
+    def distance_to_center(run):
+        start_idx, end_idx = run
+        if center_index < start_idx:
+            return start_idx - center_index
+        if center_index > end_idx:
+            return center_index - end_idx
+        return 0
+
+    start_idx, end_idx = min(pass_runs, key=distance_to_center)
+    return float(independent_axis[end_idx] - independent_axis[start_idx])
 
 
 def load_results(file: str) -> dict[dict]:
@@ -176,14 +185,14 @@ def load_results(file: str) -> dict[dict]:
         time=results[is_time, time],
         count=results[is_time, count].astype(np.int64),
         duration=results[is_time, duration],
-        passed=results[is_time, passed].astype(np.bool),
+        passed=results[is_time, passed].astype(bool),
         xlabel="Time (% UI)",
     )
     voltage_results = dict(
         voltage=results[is_voltage, voltage],
         count=results[is_voltage, count].astype(np.int64),
         duration=results[is_voltage, duration],
-        passed=results[is_voltage, passed].astype(np.bool),
+        passed=results[is_voltage, passed].astype(bool),
         xlabel="Voltage (V)",
     )
     return dict(
@@ -246,17 +255,31 @@ def format_plot(results, fig, axes):
 
 def summarize(namespace):
     files = namespace.files
+    # NEW: configurable PASS gating by Count (default 0)
+    pass_count_required = getattr(namespace, "pass_count_required", 0)
+
     table = dict(vendor_id=[], device_id=[],
                  lane=[], time_margin=[], voltage_margin=[],
                  descr=[])
     for file in files:
         results = load_results(file)
+
+        # Minimal-change gating: clone the per-sweep dicts and AND 'passed' with (count == required)
+        time_gated = dict(results["time"])
+        time_gated["passed"] = np.logical_and(results["time"]["passed"],
+                                              results["time"]["count"] == pass_count_required)
+
+        voltage_gated = dict(results["voltage"])
+        voltage_gated["passed"] = np.logical_and(results["voltage"]["passed"],
+                                                 results["voltage"]["count"] == pass_count_required)
+
         table["vendor_id"].append("0x{:04x}".format(results["vendor_id"]))
         table["device_id"].append("0x{:04x}".format(results["device_id"]))
         table["descr"].append(results["descr"])
         table["lane"].append(results["lane"])
-        table["time_margin"].append(compute_margin(results["time"], "time"))
-        table["voltage_margin"].append(compute_margin(results["voltage"], "voltage"))
+        # Pass gated dicts into the unchanged margin function
+        table["time_margin"].append(compute_margin(time_gated, "time"))
+        table["voltage_margin"].append(compute_margin(voltage_gated, "voltage"))
     headers = (
         "Vendor ID",
         "Device ID",
@@ -307,8 +330,14 @@ if __name__ == "__main__":
     plot_parser.set_defaults(func=plot)
 
     summarize_parser = subparsers.add_parser("summarize", help="Print a summary table")
+    # NEW: allow gating PASS by Count in summarize (default 0)
+    summarize_parser.add_argument(
+        "-c", "--pass-count-required", type=int, default=0,
+        help="Treat a row as PASS only if Pass==1 and Count==THIS (default: 0).",
+    )
     summarize_parser.add_argument("files", help="Input data file(s)", nargs="+")
     summarize_parser.set_defaults(func=summarize)
 
     namespace = parser.parse_args(sys.argv[1:])
     namespace.func(namespace)
+
