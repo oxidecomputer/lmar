@@ -319,13 +319,35 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
             print("No rows after port-level gating.")
             return buf.getvalue()
 
+
+        # Optional name maps (CSV may include names even if --names is not set)
+        vend_map: Dict[int, str] = {}
+        dev_map: Dict[Tuple[int, int], str] = {}
+        have_name_maps = False
+        if args.pci_ids:
+            try:
+                vend_map, dev_map = load_pci_ids(args.pci_ids)
+                have_name_maps = True
+            except Exception:
+                have_name_maps = False
+
         # Optional CSV dump of the filtered dataset
         if args.csv_out:
             with open(args.csv_out, "w", newline="", encoding="utf-8") as fh:
-                w = csv.DictWriter(fh, fieldnames=["SN", "Port", "Lane", "Vendor", "Device", "Width", "Height"])
+                fieldnames = ["SN", "Port", "Lane", "Vendor", "Device", "Width", "Height",
+                              "VendorName", "DeviceName", "PASS"]
+                w = csv.DictWriter(fh, fieldnames=fieldnames)
                 w.writeheader()
                 for r in combined:
-                    w.writerow(r)
+                    row = dict(r)
+                    row["PASS"] = "Y" if (r["Width"] >= args.pass_width and r["Height"] > args.pass_height) else "N"
+                    if have_name_maps:
+                        row["VendorName"] = vend_map.get(r["Vendor"], "")
+                        row["DeviceName"] = dev_map.get((r["Vendor"], r["Device"]), "")
+                    else:
+                        row["VendorName"] = ""
+                        row["DeviceName"] = ""
+                    w.writerow(row)
             print(f"Wrote CSV: {args.csv_out}")
 
         def mark_min(val: float, threshold: float, *, strict: bool = False) -> str:
@@ -334,12 +356,6 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
             s = f"{val:.3f}"
             fail = (val <= threshold) if strict else (val < threshold)
             return s + "!" if fail else s
-
-        # Optional name maps
-        vend_map: Dict[int, str] = {}
-        dev_map: Dict[Tuple[int, int], str] = {}
-        if args.names:
-            vend_map, dev_map = load_pci_ids(args.pci_ids)
 
         # Stats by (Port, Lane) — device vs bridge remain distinct
         by_port_lane = group_by(combined, ("Port", "Lane"))
@@ -549,8 +565,8 @@ def main():
                     help="Path to pci.ids for name resolution (download from pci-ids.ucw.cz).")
     ap.add_argument("--names", action="store_true",
                     help="Append vendor/device names to tables (requires --pci-ids).")
-    ap.add_argument("--name-width", type=int, default=18,
-                    help="Max chars for name columns (default: 18).")
+    ap.add_argument("--name-width", type=int, default=25,
+                    help="Max chars for name columns (default: 25).")
     ap.add_argument("-V", "--version", action="version", version="%(prog)s 2.3")
 
     args = ap.parse_args()

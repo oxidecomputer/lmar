@@ -178,6 +178,10 @@ struct Args {
     #[clap(short, long)]
     probe: bool,
 
+    /// Scan ports sequentially when probing (-p). By default, scanning is parallel.
+    #[clap(short = 's', long = "seq-scan")]
+    seq_scan: bool,
+
     /// Create a zip of the output directory (single-target mode only).
     ///
     /// When probing (-p), results are always zipped. This flag only affects
@@ -2433,7 +2437,7 @@ impl OutputExt for std::process::Output {
 fn margin_one(
     args: &Args,
     dir: &PathBuf,
-    node: &PcieNode,
+    node: PcieNode,
     port: Port,
 ) -> Result<()> {
     if !node.margin {
@@ -2558,13 +2562,60 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
     let mut file = File::create(f)?;
     file.write_all(&devs.stdout)?;
 
-    for b in &bridges {
-        for c in &b.children {
-            margin_one(&args, &dir, c, Port::Upstream)?;
+
+
+    if args.seq_scan {
+        // Sequential scan (legacy behavior on request)
+        for b in bridges.into_iter() {
+            for c in b.children.into_iter() {
+                margin_one(&args, &dir, c, Port::Upstream)?;
+            }
+            margin_one(&args, &dir, b.bridge, Port::Downstream)?;
         }
-        margin_one(&args, &dir, &b.bridge, Port::Downstream)?;
+    } else {
+        // Parallel scan (default)
+        let mut handles = Vec::new();
+
+        for b in bridges.into_iter() {
+            // children (upstream)
+            for c in b.children.into_iter() {
+                let args_ = args.clone();
+                let dir_ = dir.clone();
+                handles.push(std::thread::spawn(move || {
+                    margin_one(&args_, &dir_, c, Port::Upstream)
+                }));
+            }
+
+            // bridge (downstream)
+            let args_ = args.clone();
+            let dir_ = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                margin_one(&args_, &dir_, b.bridge, Port::Downstream)
+            }));
+        }
+
+        // Collect results; if any failed, return error (and skip zipping)
+        let mut failed = false;
+        for h in handles {
+            match h.join() {
+                Ok(res) => {
+                    if let Err(e) = res {
+                        eprintln!("lmar: margining a port failed: {e}");
+                        failed = true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("lmar: margin thread panicked: {e:?}");
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "one or more ports failed").into());
+        }
     }
 
+    // Zip like before (both modes)
     let zipfile = PathBuf::from(&dir).with_extension("zip");
     zip_dir(&dir, &zipfile)?;
 
