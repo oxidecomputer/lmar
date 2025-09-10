@@ -178,6 +178,13 @@ struct Args {
     #[clap(short, long)]
     probe: bool,
 
+    /// Create a zip of the output directory (single-target mode only).
+    ///
+    /// When probing (-p), results are always zipped. This flag only affects
+    /// single-target runs.
+    #[clap(short = 'z', long = "zip")]
+    zip: bool,
+
     /// Don't run Timing margining.
     #[clap(long = "no-timing", action = ArgAction::SetFalse)]
     timing: bool,
@@ -2623,7 +2630,24 @@ fn main() -> anyhow::Result<()> {
         println!("lmar: margining lanes: {lanes:?}");
     }
 
-    run_margin(None, &device, lanes, receiver, &args)?;
+    //
+    // Single-target mode should mimic probe mode's artifact layout:
+    // - create margin-<timestamp>/ and write lane files inside
+    // - zip only when -z/--zip is specified
+    //
+    let dirname =
+        format!("margin-{}", chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S"));
+    fs::create_dir(&dirname).context("Failed to create output directory")?;
+
+    run_margin(Some(&dirname), &device, lanes, receiver, &args)?;
+
+    if args.zip {
+        let dir = std::path::Path::new(&dirname);
+        let zipfile = std::path::PathBuf::from(&dirname).with_extension("zip");
+        zip_dir(dir, &zipfile)?;
+        println!("Created {}", zipfile.display());
+    }
+
 
     Ok(())
 }

@@ -507,7 +507,7 @@ checksum = "e92d2955daf279495d959fb506f3db6d17e2d62ab103f27c7d30be27a763cec1"
 
 [[package]]
 name = "lmar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
