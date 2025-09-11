@@ -83,7 +83,7 @@ pfexec ./scripts/run_margin.py -p
 
 
 # single-target BDF, all lanes, and zip the result
-pfexec ./scripts/run_margin.py 07/00/0 upstream --lanes all -z
+pfexec ./scripts/run_margin.py 63/0/0 upstream --lanes all -z
 ```
 
 
