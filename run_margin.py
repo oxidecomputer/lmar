@@ -440,21 +440,40 @@ def run_margin_summary(args, archives: List[str], margin_summary_script: str) ->
     if not os.path.isfile(script):
         fail(f"margin_summary.py not found: {script}")
 
+    # Build unified summary basename: margin_summary_<SN>_<run>
+    session_label = os.path.basename(os.path.normpath(args.summaries_dir))  # e.g. "run-2"
+    summary_base = f"margin_summary_{args.board_sn or 'UNKNOWN'}_{session_label}"
+
     written: List[str] = []
-    for arch in archives:
-        cmd = [sys.executable, script, arch, "--outdir", args.summaries_dir]
+    total = len(archives)
+    for idx, arch in enumerate(archives, start=1):
+        # First (or only) dataset => no suffix; multiple datasets get _2, _3, ...
+        out_name = f"{summary_base}.txt" if total == 1 else f"{summary_base}_{idx}.txt"
+        out_path = os.path.join(args.summaries_dir, out_name)
+
+        cmd = [sys.executable, script, arch, "--outdir", args.summaries_dir, "--out", out_name]
         if args.pass_count_required is not None:
             cmd += ["-c", str(args.pass_count_required)]
-        info(f"==> summarizing {arch}")
+        info(f"==> summarizing {arch} -> {out_name}")
         cp = run(cmd, check=True, capture=True, echo=True)
+
+        # Prefer the tool's "Wrote ..." message, but fall back to our constructed path.
+        wrote = False
         for line in (cp.stdout or "").splitlines():
-            if line.strip().startswith("Wrote "):
-                p = line.strip().split("Wrote ", 1)[1].strip()
+            s = line.strip()
+            if s.startswith("Wrote "):
+                p = s.split("Wrote ", 1)[1].strip()
                 if p.endswith(".txt"):
                     written.append(p)
+                    wrote = True
+        if not wrote and os.path.exists(out_path):
+            written.append(out_path)
+
     if not written:
+        # Final fallback to match any margin_summary_*.txt in the run's summaries dir
         for p in pathlib.Path(args.summaries_dir).glob("margin_summary_*.txt"):
             written.append(str(p))
+
     return sorted(set(written))
 
 def run_collect_summaries(args, scan_root: str, outdir: str, collect_summaries_script: str) -> List[str]:
