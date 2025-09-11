@@ -804,17 +804,55 @@ def main(argv: List[str]) -> None:
             # Optionally also write a combined board-level file across all runs.
             if args.combine_all:
                 board_stats_root = joinp(board_root, "stats")
-                saved_only = args.only_combined
-                saved_combine = args.combine_all
-                args.only_combined = True
-                args.combine_all = False
-                written2 = run_collect_summaries(args, board_root, board_stats_root, cs_path)
-                args.only_combined = saved_only
-                args.combine_all = saved_combine
-                if written2:
-                    info("==> board-level combined stats written:")
-                    for w in written2:
-                        info(f"    {w}")
+                # Build a single board-wide combined file with a self-describing name.
+                out_all = f"stats_{args.board_sn or 'UNKNOWN'}_all.txt"
+
+                # Collect all per-run summary files under this board (direct mode)
+                summaries_root = joinp(board_root, "summaries")
+                summary_files = sorted(
+                    str(p) for p in pathlib.Path(summaries_root).glob("run-*/margin_summary_*.txt")
+                )
+
+                if not summary_files:
+                    info(f"==> board-level combined stats: no summaries under {summaries_root}, skipping")
+                else:
+                    # Prepare a direct-mode call to collect_summaries.py
+                    cmd2 = [sys.executable, cs_path,
+                            "--outdir", board_stats_root,
+                            "--out", out_all]
+
+                    # Pass-through knobs
+                    if args.omit_n7_9:
+                        cmd2.append("--omit-n7-9")
+                    if args.omit_ports:
+                        cmd2 += ["--omit-ports", *args.omit_ports]
+                    if args.names and args.pci_ids:
+                        cmd2 += ["--names", "--pci-ids", args.pci_ids]
+                    if args.pass_width is not None:
+                        cmd2 += ["--pass-width", str(args.pass_width)]
+                    if args.pass_height is not None:
+                        cmd2 += ["--pass-height", str(args.pass_height)]
+                    if args.width_limit is not None:
+                        cmd2 += ["--width-limit", str(args.width_limit)]
+                    if args.height_limit is not None:
+                        cmd2 += ["--height-limit", str(args.height_limit)]
+
+                    # Positional inputs = all per-run summary files for this board
+                    cmd2 += summary_files
+
+                    ensure_dir(board_stats_root)
+                    info("==> board-level combined stats (all runs)")
+                    cp2 = run(cmd2, check=True, capture=True, echo=True)
+                    wrote_any2 = False
+                    for line in (cp2.stdout or "").splitlines():
+                        s = line.strip()
+                        if s.startswith("Wrote "):
+                            info("    " + s)
+                            wrote_any2 = True
+                    if not wrote_any2:
+                        out_path2 = joinp(board_stats_root, out_all)
+                        if os.path.exists(out_path2):
+                            info(f"    Wrote {out_path2}")
 
         else:
             # Board scope: use all runs under this board
