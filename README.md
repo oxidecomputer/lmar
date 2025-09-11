@@ -42,6 +42,11 @@ other similar device, it should be `upstream`.
 The BDF can be retrieved from the output of `/usr/lib/pci/pcieadm show-devs`, in
 the first column.
 
+For probing all PCIe devices
+```bash
+$ pfexec ./target/debug/lmar -p
+```
+
 The other options to the program control the details of the margining process,
 and can be seen with `cargo run -- --help`.
 
@@ -59,3 +64,59 @@ The tool requires a few packages:
 - `matplotlib`
 - `numpy`
 - `tabulate`
+
+## Additional scripts
+
+
+- `run_margin.py`
+Convenience wrapper around `lmar` that standardizes run layout. It invokes `lmar`
+in either probe (`-p`) or single-target mode, creates the
+`margin-<YYYY-MM-DDTHH-MM-SS>/` directory, and (optionally) produces the sibling
+`.zip` artifact. It passes through common flags (e.g., `-p`, `-z`, lane selection), so
+downstream consumers always see the same directory/zip structure.
+
+
+**Examples**
+```bash
+# probe all supported ports (parallel by default)
+pfexec ./scripts/run_margin.py -p
+
+
+# single-target BDF, all lanes, and zip the result
+pfexec ./scripts/run_margin.py 07/00/0 upstream --lanes all -z
+```
+
+
+- `margin_summary.py`
+Parses one or more `margin-results-b<bus>-d<dev>-f<func>-l<lane>` files and emits
+compact per-lane summaries (time/voltage margins, basic pass/fail stats). Summaries
+are written into a `summaries/` subdirectory alongside the run artifacts to keep
+consumers consistent.
+
+
+**Examples**
+```bash
+# summarize a single run directory
+./scripts/margin_summary.py margin-2025-09-10T12-34-56/
+
+
+# summarize specific files
+./scripts/margin_summary.py margin-*/margin-results-b*-l*
+```
+
+
+- `collect_summaries.py`
+Walks one or more run directories, discovers `summaries/` outputs, and consolidates
+them into a single table (stdout or optional CSV). Useful for aggregating results
+across multiple runs/zips.
+
+
+**Examples**
+```bash
+# aggregate summaries across several runs
+./scripts/collect_summaries.py margin-2025-09-10T12-34-56/ \
+margin-2025-09-10T14-02-11/
+
+
+# write a CSV
+./scripts/collect_summaries.py margin-* --csv all-summaries.csv
