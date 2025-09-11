@@ -495,7 +495,7 @@ def run_collect_summaries(args, scan_root: str, outdir: str, collect_summaries_s
     if not written:
         for p in pathlib.Path(outdir).glob("stats_*.txt"):
             written.append(str(p))
-        p = pathlib.Path(outdir) / "stats_all_boards.txt"
+        p = pathlib.Path(outdir) / "stats_all_runs.txt"
         if p.exists():
             written.append(str(p))
 
