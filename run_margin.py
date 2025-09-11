@@ -632,9 +632,9 @@ def main(argv: List[str]) -> None:
     ap.add_argument("--omit-ports", nargs="+", default=[], help="Additional ports to omit (e.g. N4 N5)")
     ap.add_argument("--names", action="store_true", help="Append vendor/device names (requires --pci-ids)")
     ap.add_argument("--pci-ids", default=None, help="Path to pci.ids")
-    ap.add_argument("--pass-width", type=float, default=None, help="PASS threshold for width in %UI")
+    ap.add_argument("--pass-width", type=float, default=None, help="PASS threshold for width in %%UI")
     ap.add_argument("--pass-height", type=float, default=None, help="PASS threshold for height in V")
-    ap.add_argument("--width-limit", type=float, default=None, help="Dataset gating min width in %UI")
+    ap.add_argument("--width-limit", type=float, default=None, help="Dataset gating min width in %%UI")
     ap.add_argument("--height-limit", type=float, default=None, help="Dataset gating min height in V")
 
     # margin_summary passthrough
