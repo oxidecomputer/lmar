@@ -25,7 +25,7 @@ Default session is incremental run-<N> per board/outdir. Use --session to overri
 
 Stats scope:
   --stats-scope board   -> stats over all runs under <SN>/summaries (default)
-  --stats-scope run     -> stats using only this session’s summaries/run-<N>
+  --stats-scope run     -> stats using only this session summaries/run-<N>
                            If --combine-all is also set, we additionally write a
                            board-level combined file to <SN>/stats/.
 """
@@ -624,6 +624,9 @@ def main(argv: List[str]) -> None:
 
     # Sessionization
     ap.add_argument("--session", default=None, help="Session label; default is incrementing run-<N> per board/outdir.")
+    ap.add_argument('--run-label', dest='session', default=None,
+                    help='Alias for --session; session label like run-7 or custom tag.')
+
     ap.add_argument("--on-collision", choices=["timestamp", "increment", "error", "overwrite"], default="increment",
                     help="If session already exists, choose how to uniquify (default: increment).")
     ap.add_argument("--flat-output", action="store_true",
@@ -751,7 +754,7 @@ def main(argv: List[str]) -> None:
     if not args.skip_stats:
 
         if args.stats_scope == "run":
-            # Per-run stats: ONLY the summaries from this session’s directory.
+            # Per-run stats: ONLY the summaries from this session directory.
             scan_root_run = args.summaries_dir
             ensure_dir(args.stats_dir)
     
