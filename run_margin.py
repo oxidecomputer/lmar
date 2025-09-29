@@ -431,6 +431,16 @@ def fetch_archives(args, remote_run_dir: str, remote_archives: List[str]) -> Lis
         out_paths.append(local_name)
     return out_paths
 
+def cleanup_remote_dir(remote: str, port: Optional[int], key: Optional[str], 
+                      extra_opts: List[str], rdir: str, verbose: bool) -> None:
+    payload = f"rm -rf {shlex.quote(rdir)}"
+    cmd = ssh_target(remote, port, key, extra_opts, verbose) + ["sh", "-c", sh_c_quote(payload)]
+    try:
+        run(cmd, check=False, capture=True)  # Don't fail the whole pipeline on cleanup failure
+    except Exception:
+        info(f"Warning: failed to cleanup remote directory {rdir}")
+
+
 def run_margin_summary(args, archives: List[str], margin_summary_script: str) -> List[str]:
     ensure_dir(args.summaries_dir)
     if not archives:
@@ -617,7 +627,8 @@ def main(argv: List[str]) -> None:
     ap.add_argument("--remote-cwd", default=None, help="Remote working dir (default: mktemp -d)")
     ap.add_argument("--sudo", action="store_true", help="Prefix remote lmar execution with sudo")
     ap.add_argument("--timeout", type=int, default=0, help="Reserved (no-op).")
-
+    # Add to ArgumentParser
+    ap.add_argument("--cleanup-remote", action="store_true", default=True, help="Clean up remote temp directory after completion")
     # Output layout
     ap.add_argument("--board-sn", default=None, help="Board serial number (e.g., BRM13250013). If omitted, we use the remote hostname.")
     ap.add_argument("--outdir", default=".", help="Base output directory (default: current dir)")
