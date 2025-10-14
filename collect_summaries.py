@@ -183,6 +183,9 @@ def parse_summary_file(path: str) -> List[Dict[str, Any]]:
         if math.isnan(width) or math.isnan(height) or width == 0.0 or height == 0.0:
             continue
 
+        # Port keeps full description including 'bridge' suffix.
+        # This is important because bridge and device on the same physical port
+        # are measured separately and should not be combined in stats.
         port = description_to_port(desc)
         rows.append({
             "SN": sn,
@@ -217,35 +220,59 @@ def group_by(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict[Tuple[An
 
 def gate_ports_by_limits(rows: List[Dict[str, Any]],
                          width_limit: float,
-                         height_limit: float) -> List[Dict[str, Any]]:
+                         height_limit: float,
+                         verbose: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Keep a port label only if lanes {0,1,2,3} are all present AND, for each lane,
     min(Width) >= width_limit and min(Height) >= height_limit across any duplicate
     rows for that lane. Bridge and device entries are treated as distinct ports.
+
+    Returns:
+        Tuple of (filtered_rows, drop_reasons) where drop_reasons is a list of
+        human-readable strings explaining why ports were dropped (if verbose=True).
     """
     required_lanes = {0, 1, 2, 3}
     by_sn_port = group_by(rows, ("SN", "Port"))
     passing_keys = set()
+    drop_reasons: List[str] = []
 
     for key, items in by_sn_port.items():
+        sn, port = key
         lanes: Dict[int, List[Dict[str, Any]]] = {}
         for r in items:
             lanes.setdefault(r["Lane"], []).append(r)
 
         if set(lanes.keys()) != required_lanes:
+            if verbose:
+                missing = required_lanes - set(lanes.keys())
+                drop_reasons.append(f"  {sn} / {port}: missing lanes {sorted(missing)}")
             continue
 
         ok = True
+        failed_lane = None
+        failed_width = None
+        failed_height = None
         for ln in required_lanes:
             wmin = min(x["Width"] for x in lanes[ln])
             hmin = min(x["Height"] for x in lanes[ln])
             if wmin < width_limit or hmin < height_limit:
                 ok = False
+                failed_lane = ln
+                failed_width = wmin
+                failed_height = hmin
                 break
+
         if ok:
             passing_keys.add(key)
+        elif verbose:
+            reasons = []
+            if failed_width is not None and failed_width < width_limit:
+                reasons.append(f"width {failed_width:.3f} < {width_limit}")
+            if failed_height is not None and failed_height < height_limit:
+                reasons.append(f"height {failed_height:.6f} < {height_limit}")
+            drop_reasons.append(f"  {sn} / {port}: lane {failed_lane} failed ({', '.join(reasons)})")
 
-    return [r for r in rows if (r["SN"], r["Port"]) in passing_keys]
+    return [r for r in rows if (r["SN"], r["Port"]) in passing_keys], drop_reasons
 
 
 def print_table(headers: List[str], rows: List[List[Any]]) -> None:
@@ -314,10 +341,22 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
             return buf.getvalue()
 
         # Port-level gating: require lanes 0..3 and per-lane mins ≥ limits
-        combined = gate_ports_by_limits(combined, args.width_limit, args.height_limit)
+        combined, drop_reasons = gate_ports_by_limits(combined, args.width_limit, args.height_limit, args.verbose)
+        if drop_reasons:
+            print("Ports dropped during gating:")
+            for reason in drop_reasons:
+                print(reason)
+            print()
         if not combined:
             print("No rows after port-level gating.")
             return buf.getvalue()
+
+        # Print analysis parameters header
+        print("Analysis Parameters:")
+        print(f"  Dataset gating: Width >= {args.width_limit} %UI, Height >= {args.height_limit} V")
+        print(f"  PASS criteria: Width >= {args.pass_width} %UI, Height >= {args.pass_height} V")
+        print(f"  Margin = Measured(min) - Threshold (positive = passing)")
+        print()
 
 
         # Optional name maps (CSV may include names even if --names is not set)
@@ -328,19 +367,24 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
             try:
                 vend_map, dev_map = load_pci_ids(args.pci_ids)
                 have_name_maps = True
-            except Exception:
+            except Exception as e:
+                print(f"Warning: Could not load pci.ids from {args.pci_ids}: {e}")
+                print("Continuing without vendor/device names...")
                 have_name_maps = False
 
         # Optional CSV dump of the filtered dataset
         if args.csv_out:
             with open(args.csv_out, "w", newline="", encoding="utf-8") as fh:
                 fieldnames = ["SN", "Port", "Lane", "Vendor", "Device", "Width", "Height",
+                              "WidthMargin", "HeightMargin",
                               "VendorName", "DeviceName", "PASS"]
                 w = csv.DictWriter(fh, fieldnames=fieldnames)
                 w.writeheader()
                 for r in combined:
                     row = dict(r)
-                    row["PASS"] = "Y" if (r["Width"] >= args.pass_width and r["Height"] > args.pass_height) else "N"
+                    row["PASS"] = "Y" if (r["Width"] >= args.pass_width and r["Height"] >= args.pass_height) else "N"
+                    row["WidthMargin"] = r["Width"] - args.pass_width
+                    row["HeightMargin"] = r["Height"] - args.pass_height
                     if have_name_maps:
                         row["VendorName"] = vend_map.get(r["Vendor"], "")
                         row["DeviceName"] = dev_map.get((r["Vendor"], r["Device"]), "")
@@ -350,11 +394,21 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
                     w.writerow(row)
             print(f"Wrote CSV: {args.csv_out}")
 
-        def mark_min(val: float, threshold: float, *, strict: bool = False) -> str:
+        def mark_min(val: float, threshold: float) -> str:
+            """
+            Format a minimum value and mark failures with '!'.
+
+            Args:
+                val: The value to format
+                threshold: The pass/fail threshold (passes if val >= threshold)
+
+            Returns:
+                Formatted string with '!' suffix if val < threshold
+            """
             if math.isnan(val):
                 return "nan"
             s = f"{val:.3f}"
-            fail = (val <= threshold) if strict else (val < threshold)
+            fail = (val < threshold)
             return s + "!" if fail else s
 
         # Stats by (Port, Lane) — device vs bridge remain distinct
@@ -379,12 +433,17 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
                     vname = "mixed"
                     dname = "mixed"
 
-            pass_flag = "Y" if (wmin >= args.pass_width and hmin > args.pass_height) else "N"
+            # PCIe Gen5 spec: Eye width >= 0.3 UI (30%), Eye height >= 15 mV + 1.5 mV tolerance (0.0165 V)
+            pass_flag = "Y" if (wmin >= args.pass_width and hmin >= args.pass_height) else "N"
+            width_margin = wmin - args.pass_width
+            height_margin = hmin - args.pass_height
 
             row: List[Any] = [
                 key[0], key[1], n,
-                mark_min(wmin, args.pass_width, strict=False), f"{wmean:.3f}", f"{wmax:.3f}", (f"{wstd:.3f}" if wstd is not None else "NA"),
-                mark_min(hmin, args.pass_height, strict=True), f"{hmean:.3f}", f"{hmax:.3f}", (f"{hstd:.3f}" if hstd is not None else "NA"),
+                mark_min(wmin, args.pass_width), f"{wmean:.3f}", f"{wmax:.3f}", (f"{wstd:.3f}" if wstd is not None else "NA"),
+                mark_min(hmin, args.pass_height), f"{hmean:.3f}", f"{hmax:.3f}", (f"{hstd:.3f}" if hstd is not None else "NA"),
+                f"{width_margin:+.1f}%UI",
+                f"{height_margin:+.4f}V",
             ]
             if args.names:
                 row += [vname, dname]
@@ -392,8 +451,8 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
             rows_pl.append(row)
 
         print("\nStats by (Port, Lane):")
-        header_top_pl_base = ["Port", "Lane", "N", "Width (%UI)", "", "", "", "Height (V)", "", "", ""]
-        header_sub_pl_base = ["", "", "", "min", "mean", "max", "sd", "min", "mean", "max", "sd"]
+        header_top_pl_base = ["Port", "Lane", "N", "Width (%UI)", "", "", "", "Height (V)", "", "", "", "Width", "Height"]
+        header_sub_pl_base = ["", "", "", "min", "mean", "max", "sd", "min", "mean", "max", "sd", "Margin", "Margin"]
         if args.names:
             header_top_pl = header_top_pl_base + ["Vendor name", "Device name", "PASS"]
             header_sub_pl = header_sub_pl_base + ["", "", ""]
@@ -422,12 +481,16 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
             hmin, hmax, hmean, hstd = safe_stats(heights)
             vname = trunc(vend_map.get(key[0], "unknown"), args.name_width) if args.names else None
             dname = trunc(dev_map.get((key[0], key[1]), "unknown"), args.name_width) if args.names else None
-            pass_flag = "Y" if (wmin >= args.pass_width and hmin > args.pass_height) else "N"
+            pass_flag = "Y" if (wmin >= args.pass_width and hmin >= args.pass_height) else "N"
+            width_margin = wmin - args.pass_width
+            height_margin = hmin - args.pass_height
 
             row_vd: List[Any] = [
                 f"0x{key[0]:04x}", f"0x{key[1]:04x}", n,
-                mark_min(wmin, args.pass_width, strict=False), f"{wmean:.3f}", f"{wmax:.3f}", (f"{wstd:.3f}" if wstd is not None else "NA"),
-                mark_min(hmin, args.pass_height, strict=True), f"{hmean:.3f}", f"{hmax:.3f}", (f"{hstd:.3f}" if hstd is not None else "NA"),
+                mark_min(wmin, args.pass_width), f"{wmean:.3f}", f"{wmax:.3f}", (f"{wstd:.3f}" if wstd is not None else "NA"),
+                mark_min(hmin, args.pass_height), f"{hmean:.3f}", f"{hmax:.3f}", (f"{hstd:.3f}" if hstd is not None else "NA"),
+                f"{width_margin:+.1f}%UI",
+                f"{height_margin:+.4f}V",
             ]
             if args.names:
                 row_vd += [vname, dname]
@@ -444,10 +507,12 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
 
         header_top_vd_base = ["Vendor", "Device", "N",
                               "Width (%UI)", "", "", "",
-                              "Height (V)", "", "", ""]
+                              "Height (V)", "", "", "",
+                              "Width", "Height"]
         header_sub_vd_base = ["", "", "",
                               "min", "mean", "max", "sd",
-                              "min", "mean", "max", "sd"]
+                              "min", "mean", "max", "sd",
+                              "Margin", "Margin"]
         if args.names:
             header_top_vd = header_top_vd_base + ["Vendor name", "Device name", "PASS"]
             header_sub_vd = header_sub_vd_base + ["", "", ""]
@@ -512,7 +577,7 @@ def main():
               {prog} summaries/*.txt --out stats_BRM13250002_all.txt
 
               # Enforce dataset gating and tweak PASS thresholds
-              {prog} --width-limit 12.5 --height-limit 0.085 --pass-width 30 --pass-height 0.015 summaries/*.txt
+              {prog} --width-limit 12.5 --height-limit 0.085 --pass-width 30 --pass-height 0.0165 summaries/*.txt
 
               # Append vendor/device names (requires pci.ids)
               {prog} --names --pci-ids /path/to/pci.ids summaries/*.txt
@@ -554,9 +619,9 @@ def main():
     ap.add_argument("--height-limit", type=float, default=0.0,
                     help="Minimum acceptable eye height in V for dataset gating (default: 0.0).")
     ap.add_argument("--pass-width", type=float, default=30.0,
-                    help="PASS threshold for width in %%UI used in summary tables (default: 30.0).")
-    ap.add_argument("--pass-height", type=float, default=0.015,
-                    help="PASS threshold for height in V used in summary tables (default: 0.015).")
+                    help="PASS threshold for width in %%UI used in summary tables (default: 30.0, PCIe Gen5 spec).")
+    ap.add_argument("--pass-height", type=float, default=0.0165,
+                    help="PASS threshold for height in V used in summary tables (default: 0.0165, PCIe Gen5 spec 15mV + tolerance).")
     ap.add_argument("--omit-ports", nargs="+", default=[],
                     help="Port labels to omit from Vendor/Device stats (canonicalized: e.g., 'n07', 'N7 bridge' -> N7).")
     ap.add_argument("--omit-n7-9", action="store_true",
@@ -567,6 +632,8 @@ def main():
                     help="Append vendor/device names to tables (requires --pci-ids).")
     ap.add_argument("--name-width", type=int, default=25,
                     help="Max chars for name columns (default: 25).")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="Enable verbose output showing filtering details.")
     ap.add_argument("-V", "--version", action="version", version="%(prog)s 2.3")
 
     args = ap.parse_args()
