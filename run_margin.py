@@ -503,6 +503,8 @@ def run_collect_summaries(args, scan_root: str, outdir: str, collect_summaries_s
         base_cmd.append("--omit-n7-9")
     if args.omit_ports:
         base_cmd += ["--omit-ports", *args.omit_ports]
+    if args.omit_zero_data:
+        base_cmd.append("--omit-zero-data")
     if args.names and args.pci_ids:
         base_cmd += ["--names", "--pci-ids", args.pci_ids]
     if args.pass_width is not None:
@@ -663,6 +665,7 @@ def main(argv: List[str]) -> None:
     ap.add_argument("--only-combined", action="store_true", help="Write only combined file (skip per-summary outputs).")
     ap.add_argument("--omit-n7-9", action="store_true", help="Omit N7/N8/N9 from Vendor/Device stats")
     ap.add_argument("--omit-ports", nargs="+", default=[], help="Additional ports to omit (e.g. N4 N5)")
+    ap.add_argument("--omit-zero-data", action="store_true", help="Drop rows where width or height is 0.0 (default: zeros are kept)")
     ap.add_argument("--names", action="store_true", help="Append vendor/device names (requires --pci-ids)")
     ap.add_argument("--pci-ids", default=None, help="Path to pci.ids")
     ap.add_argument("--pass-width", type=float, default=None, help="PASS threshold for width in %%UI")
@@ -790,6 +793,8 @@ def main(argv: List[str]) -> None:
                 cmd.append("--omit-n7-9")
             if args.omit_ports:
                 cmd += ["--omit-ports", *args.omit_ports]
+            if args.omit_zero_data:
+                cmd.append("--omit-zero-data")
             if args.names and args.pci_ids:
                 cmd += ["--names", "--pci-ids", args.pci_ids]
             if args.pass_width is not None:
@@ -840,6 +845,8 @@ def main(argv: List[str]) -> None:
                         cmd2.append("--omit-n7-9")
                     if args.omit_ports:
                         cmd2 += ["--omit-ports", *args.omit_ports]
+                    if args.omit_zero_data:
+                        cmd2.append("--omit-zero-data")
                     if args.names and args.pci_ids:
                         cmd2 += ["--names", "--pci-ids", args.pci_ids]
                     if args.pass_width is not None:

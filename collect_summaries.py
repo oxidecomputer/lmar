@@ -126,13 +126,13 @@ def trunc(s: Optional[str], n: int) -> str:
     return s if len(s) <= n else (s[: max(1, n - 3)] + "...")
 
 
-def parse_summary_file(path: str) -> List[Dict[str, Any]]:
+def parse_summary_file(path: str, omit_zero_data: bool = False) -> List[Dict[str, Any]]:
     """
     Parse a single summary*.txt file emitted by margin_summary.py / analyze.py summarize.
     Expects columns:
       Vendor ID | Device ID | Lane | Time margin (% UI) | Voltage margin (V) | Description
     Returns a list of dicts with SN, Port, Lane, Vendor, Device, Width, Height
-    (dropping rows where width/height is NaN or 0.0).
+    (dropping rows where width/height is NaN, and optionally dropping zeros).
     """
     sn, _ = parse_sn_from_filename(path)
     rows: List[Dict[str, Any]] = []
@@ -179,8 +179,12 @@ def parse_summary_file(path: str) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
-        # Drop NaNs and zero-width/zero-height (invalid/no data collected)
-        if math.isnan(width) or math.isnan(height) or width == 0.0 or height == 0.0:
+        # Always drop NaNs (invalid/no data collected)
+        if math.isnan(width) or math.isnan(height):
+            continue
+
+        # Optionally drop zeros
+        if omit_zero_data and (width == 0.0 or height == 0.0):
             continue
 
         # Port keeps full description including 'bridge' suffix.
@@ -334,7 +338,7 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
 
         combined: List[Dict[str, Any]] = []
         for path in files_sorted:
-            combined.extend(parse_summary_file(path))
+            combined.extend(parse_summary_file(path, omit_zero_data=args.omit_zero_data))
 
         if not combined:
             print("No usable rows (after dropping NaNs/zeros).")
@@ -626,6 +630,8 @@ def main():
                     help="Port labels to omit from Vendor/Device stats (canonicalized: e.g., 'n07', 'N7 bridge' -> N7).")
     ap.add_argument("--omit-n7-9", action="store_true",
                     help="Convenience flag to omit ports N7, N8, and N9 from Vendor/Device stats.")
+    ap.add_argument("--omit-zero-data", action="store_true",
+                    help="Drop rows where width or height is 0.0 (by default, zeros are kept).")
     ap.add_argument("--pci-ids", default=None,
                     help="Path to pci.ids for name resolution (download from pci-ids.ucw.cz).")
     ap.add_argument("--names", action="store_true",

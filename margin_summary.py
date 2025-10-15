@@ -172,6 +172,8 @@ def summarize(files: List[str], pass_count_required: int) -> str:
     table = dict(vendor_id=[], device_id=[],
                  lane=[], time_margin=[], voltage_margin=[],
                  descr=[])
+    warnings = []
+
     for file in files:
         results = load_results(file)
 
@@ -184,12 +186,28 @@ def summarize(files: List[str], pass_count_required: int) -> str:
         voltage_gated["passed"] = np.logical_and(results["voltage"]["passed"],
                                                  results["voltage"]["count"] == pass_count_required)
 
+        time_margin = compute_margin(time_gated, "time")
+        voltage_margin = compute_margin(voltage_gated, "voltage")
+
+        # Check for bad data and collect warnings
+        descr = results["descr"]
+        lane = results["lane"]
+        if np.isnan(time_margin):
+            warnings.append(f"WARNING: {descr} lane {lane}: time margin is NaN (no valid data)")
+        elif time_margin == 0.0:
+            warnings.append(f"WARNING: {descr} lane {lane}: time margin is 0.0")
+
+        if np.isnan(voltage_margin):
+            warnings.append(f"WARNING: {descr} lane {lane}: voltage margin is NaN (no valid data)")
+        elif voltage_margin == 0.0:
+            warnings.append(f"WARNING: {descr} lane {lane}: voltage margin is 0.0")
+
         table["vendor_id"].append("0x{:04x}".format(results["vendor_id"]))
         table["device_id"].append("0x{:04x}".format(results["device_id"]))
-        table["descr"].append(results["descr"])
-        table["lane"].append(results["lane"])
-        table["time_margin"].append(compute_margin(time_gated, "time"))
-        table["voltage_margin"].append(compute_margin(voltage_gated, "voltage"))
+        table["descr"].append(descr)
+        table["lane"].append(lane)
+        table["time_margin"].append(time_margin)
+        table["voltage_margin"].append(voltage_margin)
 
     headers = (
         "Vendor ID",
@@ -199,7 +217,16 @@ def summarize(files: List[str], pass_count_required: int) -> str:
         "Voltage margin (V)",
         "Description",
     )
-    return tabulate(table, headers=headers)
+
+    # Build output with warnings first, then table
+    output = []
+    if warnings:
+        output.append("Data Quality Warnings:")
+        output.extend(warnings)
+        output.append("")  # blank line before table
+
+    output.append(tabulate(table, headers=headers))
+    return "\n".join(output)
 
 
 # ---------- File collection helpers ----------
