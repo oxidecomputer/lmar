@@ -539,7 +539,7 @@ def build_output_dirs(outbase: str,
                       board_sn: Optional[str],
                       session: Optional[str],
                       flat_output: bool,
-                      on_collision: str) -> tuple[str, str, str, str]:
+                      on_collision: str) -> Tuple[str, str, str, str]:
     base = os.path.abspath(outbase)
 
     if board_sn:
