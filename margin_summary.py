@@ -172,7 +172,6 @@ def summarize(files: List[str], pass_count_required: int) -> str:
     table = dict(vendor_id=[], device_id=[],
                  lane=[], time_margin=[], voltage_margin=[],
                  descr=[])
-    warnings = []
 
     for file in files:
         results = load_results(file)
@@ -189,18 +188,18 @@ def summarize(files: List[str], pass_count_required: int) -> str:
         time_margin = compute_margin(time_gated, "time")
         voltage_margin = compute_margin(voltage_gated, "voltage")
 
-        # Check for bad data and collect warnings
+        # Check for bad data and print warnings to stderr
         descr = results["descr"]
         lane = results["lane"]
         if np.isnan(time_margin):
-            warnings.append(f"WARNING: {descr} lane {lane}: time margin is NaN (no valid data)")
+            print(f"WARNING: {descr} lane {lane}: time margin is NaN (no valid data)", file=sys.stderr)
         elif time_margin == 0.0:
-            warnings.append(f"WARNING: {descr} lane {lane}: time margin is 0.0")
+            print(f"WARNING: {descr} lane {lane}: time margin is 0.0", file=sys.stderr)
 
         if np.isnan(voltage_margin):
-            warnings.append(f"WARNING: {descr} lane {lane}: voltage margin is NaN (no valid data)")
+            print(f"WARNING: {descr} lane {lane}: voltage margin is NaN (no valid data)", file=sys.stderr)
         elif voltage_margin == 0.0:
-            warnings.append(f"WARNING: {descr} lane {lane}: voltage margin is 0.0")
+            print(f"WARNING: {descr} lane {lane}: voltage margin is 0.0", file=sys.stderr)
 
         table["vendor_id"].append("0x{:04x}".format(results["vendor_id"]))
         table["device_id"].append("0x{:04x}".format(results["device_id"]))
@@ -218,15 +217,7 @@ def summarize(files: List[str], pass_count_required: int) -> str:
         "Description",
     )
 
-    # Build output with warnings first, then table
-    output = []
-    if warnings:
-        output.append("Data Quality Warnings:")
-        output.extend(warnings)
-        output.append("")  # blank line before table
-
-    output.append(tabulate(table, headers=headers))
-    return "\n".join(output)
+    return tabulate(table, headers=headers)
 
 
 # ---------- File collection helpers ----------
