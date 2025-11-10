@@ -2562,8 +2562,6 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
     let mut file = File::create(f)?;
     file.write_all(&devs.stdout)?;
 
-
-
     if args.seq_scan {
         // Sequential scan (legacy behavior on request)
         for b in bridges.into_iter() {
@@ -2581,37 +2579,55 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
             for c in b.children.into_iter() {
                 let args_ = args.clone();
                 let dir_ = dir.clone();
-                handles.push(std::thread::spawn(move || {
-                    margin_one(&args_, &dir_, c, Port::Upstream)
-                }));
+                let node_str = format!("{}", c);
+                handles.push((
+                    node_str,
+                    std::thread::spawn(move || {
+                        margin_one(&args_, &dir_, c, Port::Upstream)
+                    }),
+                ));
             }
 
             // bridge (downstream)
             let args_ = args.clone();
             let dir_ = dir.clone();
-            handles.push(std::thread::spawn(move || {
-                margin_one(&args_, &dir_, b.bridge, Port::Downstream)
-            }));
+            let node_str = format!("{}", b.bridge);
+            handles.push((
+                node_str,
+                std::thread::spawn(move || {
+                    margin_one(&args_, &dir_, b.bridge, Port::Downstream)
+                }),
+            ));
         }
 
         // Collect results; if any failed, return error (and skip zipping)
         let mut failed = false;
-        for h in handles {
+        for (node_str, h) in handles {
             match h.join() {
                 Ok(res) => {
                     if let Err(e) = res {
-                        eprintln!("lmar: margining a port failed: {e}");
+                        eprintln!(
+                            "lmar: margining failed for {}: {e}",
+                            node_str
+                        );
                         failed = true;
                     }
                 }
                 Err(e) => {
-                    eprintln!("lmar: margin thread panicked: {e:?}");
+                    eprintln!(
+                        "lmar: margin thread panicked for {}: {e:?}",
+                        node_str
+                    );
                     failed = true;
                 }
             }
         }
         if failed {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "one or more ports failed").into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "one or more ports failed",
+            )
+            .into());
         }
     }
 
@@ -2698,7 +2714,6 @@ fn main() -> anyhow::Result<()> {
         zip_dir(dir, &zipfile)?;
         println!("Created {}", zipfile.display());
     }
-
 
     Ok(())
 }
