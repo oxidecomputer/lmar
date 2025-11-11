@@ -2790,15 +2790,14 @@ fn run_margin(
         // Construct object for running the margining protocol.
         let margin = LaneMargin::new(device_, receiver, lane, args.verbose)
             .with_context(|| {
+                let direction = match u8::from(receiver) {
+                    0b110 => "upstream",
+                    0b001 => "downstream",
+                    _ => "unknown",
+                };
                 format!(
                     "Could not initialize lane margining for {} {} lane {}",
-                    device.bdf,
-                    if receiver == Receiver::upstream() {
-                        "upstream"
-                    } else {
-                        "downstream"
-                    },
-                    lane
+                    device.bdf, direction, lane
                 )
             })?;
 
