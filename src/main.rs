@@ -202,6 +202,12 @@ struct Args {
     /// Run Voltage margining if supported [default].
     #[clap(long = "voltage", overrides_with = "voltage")]
     _no_voltage: bool,
+
+    /// Exclude PCIe bridges by name or BDF (comma-separated or repeated).
+    ///
+    /// Examples: --exclude pcieb16,pcieb17  or  --exclude c0/1/1,e0/1/2
+    #[clap(long = "exclude", value_delimiter = ',')]
+    exclude: Vec<String>,
 }
 
 /// Errors working with a PCIe device
@@ -2325,6 +2331,31 @@ fn enum_pcie_devices() -> Result<Vec<PcieBridge>> {
     Ok(bridges)
 }
 
+/// Check if a bridge should be excluded based on the exclusion patterns.
+/// Supports matching by:
+/// - Bridge name with instance (e.g., "pcieb16")
+/// - BDF (e.g., "c0/1/1")
+fn should_exclude_bridge(bridge: &PcieBridge, exclusions: &[String]) -> bool {
+    for pattern in exclusions {
+        // Check if pattern matches "pcieXX" format (bridge name + instance)
+        if let Some(driver) = &bridge.bridge.driver {
+            if let Some(instance) = bridge.bridge.instance {
+                let bridge_name = format!("{}{}", driver, instance);
+                if bridge_name == *pattern {
+                    return true;
+                }
+            }
+        }
+
+        // Check if pattern matches BDF format
+        let bdf_str = format!("{}", bridge.bridge.device.bdf);
+        if bdf_str == *pattern {
+            return true;
+        }
+    }
+    false
+}
+
 /// A point at which the margining protocol was run.
 #[derive(Debug, Clone, Copy)]
 pub enum MarginPoint {
@@ -2646,7 +2677,13 @@ fn main() -> anyhow::Result<()> {
     if args.probe {
         let bridges = enum_pcie_devices()?;
 
-        for b in &bridges {
+        // Filter out excluded bridges
+        let filtered_bridges: Vec<_> = bridges
+            .into_iter()
+            .filter(|b| !should_exclude_bridge(b, &args.exclude))
+            .collect();
+
+        for b in &filtered_bridges {
             println!("{}", b.bridge);
 
             for c in &b.children {
@@ -2655,7 +2692,7 @@ fn main() -> anyhow::Result<()> {
         }
         if !args.report_only {
             println!("---");
-            margin_all(args, bridges)?;
+            margin_all(args, filtered_bridges)?;
         }
         return Ok(());
     }
@@ -2752,7 +2789,18 @@ fn run_margin(
 
         // Construct object for running the margining protocol.
         let margin = LaneMargin::new(device_, receiver, lane, args.verbose)
-            .context("Could not initialize lane margining")?;
+            .with_context(|| {
+                format!(
+                    "Could not initialize lane margining for {} {} lane {}",
+                    device.bdf,
+                    if receiver == Receiver::upstream() {
+                        "upstream"
+                    } else {
+                        "downstream"
+                    },
+                    lane
+                )
+            })?;
 
         // All margining threads will send us this report of
         // capabilities. Let's only print one of them.
