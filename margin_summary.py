@@ -68,10 +68,12 @@ COSMO_MAP = {
 
 def compute_margin(results: Dict[str, np.ndarray], key: str) -> float:
     """
-    Robust margin finder:
-    - Prefers the contiguous PASS run centered around 0 on the independent axis.
-    - If the center sample is FAIL, uses the PASS run nearest to center.
-    - Ignores stray PASS islands at the window edges.
+    Eye diagram margin calculator:
+    - Finds the contiguous PASS run centered around 0 on the independent axis.
+    - Calculates margin as 2 × min(left_edge, right_edge) from center.
+    - For time: 2 × min(abs(left), abs(right)) in %UI
+    - For voltage: 2 × min(abs(top), abs(bottom)) in V
+    - This represents the symmetric eye opening around center.
     """
     passed = np.asarray(results["passed"], dtype=bool)
     independent_axis = np.asarray(results[key])
@@ -82,8 +84,6 @@ def compute_margin(results: Dict[str, np.ndarray], key: str) -> float:
     n_passes = int(np.sum(passed))
     if n_passes == 0:
         return 0.0
-    if n_passes == n_points:
-        return float(np.ptp(independent_axis))
 
     # Find contiguous PASS runs as (start_idx, end_idx), inclusive.
     transitions = np.diff(passed.astype(np.int8))
@@ -103,27 +103,49 @@ def compute_margin(results: Dict[str, np.ndarray], key: str) -> float:
     center_index = int(np.argmin(np.abs(independent_axis)))
 
     # Prefer the run that contains the center.
+    selected_run = None
     for start_idx, end_idx in pass_runs:
         if start_idx <= center_index <= end_idx:
-            return float(independent_axis[end_idx] - independent_axis[start_idx])
+            selected_run = (start_idx, end_idx)
+            break
 
-    # Otherwise, choose the run nearest to the center by index distance.
-    def distance_to_center(run: Tuple[int, int]) -> int:
-        start_idx, end_idx = run
-        if center_index < start_idx:
-            return start_idx - center_index
-        if center_index > end_idx:
-            return center_index - end_idx
-        return 0
+    # If center is not in any pass run, choose the run nearest to center.
+    if selected_run is None:
+        def distance_to_center(run: Tuple[int, int]) -> int:
+            start_idx, end_idx = run
+            if center_index < start_idx:
+                return start_idx - center_index
+            if center_index > end_idx:
+                return center_index - end_idx
+            return 0
+        selected_run = min(pass_runs, key=distance_to_center)
 
-    start_idx, end_idx = min(pass_runs, key=distance_to_center)
-    return float(independent_axis[end_idx] - independent_axis[start_idx])
+    start_idx, end_idx = selected_run
+
+    # If all points pass, return the full range
+    if n_passes == n_points:
+        return float(np.ptp(independent_axis))
+
+    # Calculate eye margin as 2 × min(left_edge, right_edge) from center
+    # Left edge: distance from center to start of pass region
+    # Right edge: distance from center to end of pass region
+    left_edge = abs(independent_axis[start_idx] - independent_axis[center_index])
+    right_edge = abs(independent_axis[end_idx] - independent_axis[center_index])
+
+    # Return 2× the minimum edge (symmetric eye opening)
+    return 2.0 * float(min(left_edge, right_edge))
 
 
-def load_results(file: str) -> Dict[str, object]:
+def load_results(file: str, pass_err_cnt: Optional[int] = None) -> Dict[str, object]:
     """Load the lane margining results from a file.
 
     Returns a dict with results for time and voltage sweeps.
+
+    Args:
+        file: Path to the margin results file
+        pass_err_cnt: Maximum error count for a point to be considered PASS.
+                      If provided, ignores the PASS column and recalculates based on count <= pass_err_cnt.
+                      If None (default), uses the PASS column from the file.
     """
     with open(file, "rb") as f:
         vendor_id = int(f.readline().rstrip().rsplit()[-1], base=16)
@@ -139,21 +161,32 @@ def load_results(file: str) -> Dict[str, object]:
 
     # Load the table body (tab-separated) skipping the 3 header lines + 1 blank
     results = np.loadtxt(file, skiprows=4, delimiter="\t")
-    (time, voltage, duration, count, passed) = range(5)
+    (time, voltage, duration, count, passed_col) = range(5)
     is_time = results[:, time] != 0
     is_voltage = np.logical_not(is_time)
+
+    # Determine PASS status: either from count threshold or original PASS column
+    if pass_err_cnt is not None:
+        # Recalculate PASS based on error count threshold: PASS if count <= pass_err_cnt
+        time_passed = results[is_time, count] <= pass_err_cnt
+        voltage_passed = results[is_voltage, count] <= pass_err_cnt
+    else:
+        # Use original PASS column from the file
+        time_passed = results[is_time, passed_col].astype(bool)
+        voltage_passed = results[is_voltage, passed_col].astype(bool)
+
     time_results = dict(
         time=results[is_time, time],
         count=results[is_time, count].astype(np.int64),
         duration=results[is_time, duration],
-        passed=results[is_time, passed].astype(bool),
+        passed=time_passed.astype(bool),
         xlabel="Time (% UI)",
     )
     voltage_results = dict(
         voltage=results[is_voltage, voltage],
         count=results[is_voltage, count].astype(np.int64),
         duration=results[is_voltage, duration],
-        passed=results[is_voltage, passed].astype(bool),
+        passed=voltage_passed.astype(bool),
         xlabel="Voltage (V)",
     )
     return dict(
@@ -167,23 +200,30 @@ def load_results(file: str) -> Dict[str, object]:
     )
 
 
-def summarize(files: List[str], pass_count_required: int) -> str:
+def summarize(files: List[str], pass_count_required: int, pass_err_cnt: Optional[int] = None) -> str:
     """Return the summary table string for the provided files."""
     table = dict(vendor_id=[], device_id=[],
                  lane=[], time_margin=[], voltage_margin=[],
                  descr=[])
 
     for file in files:
-        results = load_results(file)
+        results = load_results(file, pass_err_cnt=pass_err_cnt)
 
-        # Clone per-sweep dicts and AND 'passed' with (count == required)
-        time_gated = dict(results["time"])
-        time_gated["passed"] = np.logical_and(results["time"]["passed"],
-                                              results["time"]["count"] == pass_count_required)
+        # If using pass_err_cnt, use results as-is
+        # If using original PASS column, apply pass_count_required filtering
+        if pass_err_cnt is not None:
+            # Using error count threshold - use results directly
+            time_gated = results["time"]
+            voltage_gated = results["voltage"]
+        else:
+            # Using original PASS column - apply pass_count_required filter
+            time_gated = dict(results["time"])
+            time_gated["passed"] = np.logical_and(results["time"]["passed"],
+                                                  results["time"]["count"] == pass_count_required)
 
-        voltage_gated = dict(results["voltage"])
-        voltage_gated["passed"] = np.logical_and(results["voltage"]["passed"],
-                                                 results["voltage"]["count"] == pass_count_required)
+            voltage_gated = dict(results["voltage"])
+            voltage_gated["passed"] = np.logical_and(results["voltage"]["passed"],
+                                                     results["voltage"]["count"] == pass_count_required)
 
         time_margin = compute_margin(time_gated, "time")
         voltage_margin = compute_margin(voltage_gated, "voltage")
@@ -366,7 +406,7 @@ def _find_board_dir(path: str) -> Optional[str]:
 
 # ---------- Scan mode orchestration ----------
 
-def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: int) -> None:
+def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: int, pass_err_cnt: Optional[int]) -> None:
     """Write summaries for one board directory."""
     os.makedirs(outdir, exist_ok=True)
     suffix_counter: Dict[str, int] = {}
@@ -404,7 +444,7 @@ def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: in
                 base_key = label  # e.g., 'BRM22250002_1'
                 suf = _unique_suffix(suffix_counter, base_key)
                 outname = f"margin_summary_{label}{suf}.txt"
-                text = summarize(files, pass_count_required)
+                text = summarize(files, pass_count_required, pass_err_cnt)
                 outpath = os.path.join(outdir, outname)
                 with open(outpath, "w", encoding="utf-8") as fh:
                     fh.write(text + "\n")
@@ -442,7 +482,7 @@ def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: in
                 n = suffix_counter[base_key]
                 outname = f"margin_summary_{board}_{n}.txt"  # no extra suffix
 
-            text = summarize(files, pass_count_required)
+            text = summarize(files, pass_count_required, pass_err_cnt)
             outpath = os.path.join(outdir, outname)
             with open(outpath, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
@@ -453,14 +493,14 @@ def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: in
             label = f"{board}_plain"
             suf = _unique_suffix(suffix_counter, label)
             outname = f"margin_summary_{label}{suf}.txt"
-            text = summarize(top_plain, pass_count_required)
+            text = summarize(top_plain, pass_count_required, pass_err_cnt)
             outpath = os.path.join(outdir, outname)
             with open(outpath, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
             print(f"Wrote {outpath}")
 
 
-def scan_and_write(scan_root: str, outdir: str, pass_count_required: int) -> None:
+def scan_and_write(scan_root: str, outdir: str, pass_count_required: int, pass_err_cnt: Optional[int]) -> None:
     os.makedirs(outdir, exist_ok=True)
 
     # Support scan_root being either a single board dir or a parent of many board dirs.
@@ -480,12 +520,12 @@ def scan_and_write(scan_root: str, outdir: str, pass_count_required: int) -> Non
         sys.exit(2)
 
     for board, board_dir in board_map.items():
-        _scan_board(board, board_dir, outdir, pass_count_required)
+        _scan_board(board, board_dir, outdir, pass_count_required, pass_err_cnt)
 
 
 # ---------- Direct mode (per-archive outputs; keep tempdir alive) ----------
 
-def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_count_required: int) -> None:
+def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_count_required: int, pass_err_cnt: Optional[int]) -> None:
     """Produce summaries for given inputs. Each archive/dataset -> its own file."""
     os.makedirs(outdir, exist_ok=True)
 
@@ -565,7 +605,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
             if len(datasets) != 1:
                 print("--out may be used only when exactly one dataset is provided.", file=sys.stderr)
                 sys.exit(2)
-            text = summarize(datasets[0][1], pass_count_required)
+            text = summarize(datasets[0][1], pass_count_required, pass_err_cnt)
             out_full = out_path if os.path.isabs(out_path) else os.path.join(outdir, out_path)
             with open(out_full, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
@@ -585,7 +625,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
                 suf = _unique_suffix(suffix_counter, name_key)
                 outname = f"margin_summary_{name_key}{suf}.txt"
 
-            text = summarize(files, pass_count_required)
+            text = summarize(files, pass_count_required, pass_err_cnt)
             outpath = os.path.join(outdir, outname)
             with open(outpath, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
@@ -603,6 +643,10 @@ def main(argv: List[str]) -> None:
         "-c", "--pass-count-required", type=int, default=0,
         help="Treat a row as PASS only if Pass==1 and Count==THIS (default: 0).",
     )
+    parser.add_argument(
+        "--pass-err-cnt", type=int, default=None,
+        help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. If not specified, uses the PASS column from the data file.",
+    )
     parser.add_argument("--scan-root", default=None,
                         help="Scan a top directory containing board directories, "
                              "or a single board directory (e.g., BRM13250010).")
@@ -618,13 +662,13 @@ def main(argv: List[str]) -> None:
     if ns.scan_root:
         if ns.inputs:
             print("Ignore positional inputs when using --scan-root.", file=sys.stderr)
-        scan_and_write(ns.scan_root, ns.outdir, ns.pass_count_required)
+        scan_and_write(ns.scan_root, ns.outdir, ns.pass_count_required, ns.pass_err_cnt)
         return
 
     if not ns.inputs:
         parser.error("either provide positional inputs or use --scan-root")
 
-    direct_mode(ns.inputs, ns.outdir, ns.out, ns.pass_count_required)
+    direct_mode(ns.inputs, ns.outdir, ns.out, ns.pass_count_required, ns.pass_err_cnt)
 
 
 if __name__ == "__main__":

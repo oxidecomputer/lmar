@@ -109,10 +109,12 @@ COSMO_MAP = {
 
 def compute_margin(results, key) -> float:
     """
-    Robust margin finder:
-    - Prefers the contiguous PASS run centered around 0 on the independent axis.
-    - If the center sample is FAIL, uses the PASS run nearest to center.
-    - Ignores stray PASS islands at the window edges.
+    Eye diagram margin calculator:
+    - Finds the contiguous PASS run centered around 0 on the independent axis.
+    - Calculates margin as 2 × min(left_edge, right_edge) from center.
+    - For time: 2 × min(abs(left), abs(right)) in %UI
+    - For voltage: 2 × min(abs(top), abs(bottom)) in V
+    - This represents the symmetric eye opening around center.
     """
     passed = np.asarray(results["passed"], dtype=bool)
     independent_axis = np.asarray(results[key])
@@ -123,8 +125,6 @@ def compute_margin(results, key) -> float:
     n_passes = int(np.sum(passed))
     if n_passes == 0:
         return 0.0
-    if n_passes == n_points:
-        return float(np.ptp(independent_axis))
 
     # Find contiguous PASS runs as (start_idx, end_idx), inclusive.
     transitions = np.diff(passed.astype(np.int8))
@@ -144,27 +144,49 @@ def compute_margin(results, key) -> float:
     center_index = int(np.argmin(np.abs(independent_axis)))
 
     # Prefer the run that contains the center.
+    selected_run = None
     for start_idx, end_idx in pass_runs:
         if start_idx <= center_index <= end_idx:
-            return float(independent_axis[end_idx] - independent_axis[start_idx])
+            selected_run = (start_idx, end_idx)
+            break
 
-    # Otherwise, choose the run nearest to the center by index distance.
-    def distance_to_center(run):
-        start_idx, end_idx = run
-        if center_index < start_idx:
-            return start_idx - center_index
-        if center_index > end_idx:
-            return center_index - end_idx
-        return 0
+    # If center is not in any pass run, choose the run nearest to center.
+    if selected_run is None:
+        def distance_to_center(run):
+            start_idx, end_idx = run
+            if center_index < start_idx:
+                return start_idx - center_index
+            if center_index > end_idx:
+                return center_index - end_idx
+            return 0
+        selected_run = min(pass_runs, key=distance_to_center)
 
-    start_idx, end_idx = min(pass_runs, key=distance_to_center)
-    return float(independent_axis[end_idx] - independent_axis[start_idx])
+    start_idx, end_idx = selected_run
+
+    # If all points pass, return the full range
+    if n_passes == n_points:
+        return float(np.ptp(independent_axis))
+
+    # Calculate eye margin as 2 × min(left_edge, right_edge) from center
+    # Left edge: distance from center to start of pass region
+    # Right edge: distance from center to end of pass region
+    left_edge = abs(independent_axis[start_idx] - independent_axis[center_index])
+    right_edge = abs(independent_axis[end_idx] - independent_axis[center_index])
+
+    # Return 2× the minimum edge (symmetric eye opening)
+    return 2.0 * float(min(left_edge, right_edge))
 
 
-def load_results(file: str) -> dict[dict]:
+def load_results(file: str, pass_err_cnt: int | None = None) -> dict[dict]:
     """Load the lane margining results from a file.
 
     Returns a dict with the results for left and right separately.
+
+    Args:
+        file: Path to the margin results file
+        pass_err_cnt: Maximum error count for a point to be considered PASS.
+                      If provided, ignores the PASS column and recalculates based on count <= pass_err_cnt.
+                      If None (default), uses the PASS column from the file.
     """
     with open(file, "rb") as f:
         vendor_id = int(f.readline().rstrip().rsplit()[-1], base=16)
@@ -178,21 +200,32 @@ def load_results(file: str) -> dict[dict]:
         descr = COSMO_MAP.get((bus, dev, func), "?")
 
     results = np.loadtxt(file, skiprows=4, delimiter="\t")
-    (time, voltage, duration, count, passed) = range(5)
+    (time, voltage, duration, count, passed_col) = range(5)
     is_time = results[:, time] != 0
     is_voltage = np.logical_not(is_time)
+
+    # Determine PASS status: either from count threshold or original PASS column
+    if pass_err_cnt is not None:
+        # Recalculate PASS based on error count threshold: PASS if count <= pass_err_cnt
+        time_passed = results[is_time, count] <= pass_err_cnt
+        voltage_passed = results[is_voltage, count] <= pass_err_cnt
+    else:
+        # Use original PASS column from the file
+        time_passed = results[is_time, passed_col].astype(bool)
+        voltage_passed = results[is_voltage, passed_col].astype(bool)
+
     time_results = dict(
         time=results[is_time, time],
         count=results[is_time, count].astype(np.int64),
         duration=results[is_time, duration],
-        passed=results[is_time, passed].astype(bool),
+        passed=time_passed.astype(bool),
         xlabel="Time (% UI)",
     )
     voltage_results = dict(
         voltage=results[is_voltage, voltage],
         count=results[is_voltage, count].astype(np.int64),
         duration=results[is_voltage, duration],
-        passed=results[is_voltage, passed].astype(bool),
+        passed=voltage_passed.astype(bool),
         xlabel="Voltage (V)",
     )
     return dict(
@@ -257,21 +290,29 @@ def summarize(namespace):
     files = namespace.files
     # NEW: configurable PASS gating by Count (default 0)
     pass_count_required = getattr(namespace, "pass_count_required", 0)
+    pass_err_cnt = getattr(namespace, "pass_err_cnt", None)
 
     table = dict(vendor_id=[], device_id=[],
                  lane=[], time_margin=[], voltage_margin=[],
                  descr=[])
     for file in files:
-        results = load_results(file)
+        results = load_results(file, pass_err_cnt=pass_err_cnt)
 
-        # Minimal-change gating: clone the per-sweep dicts and AND 'passed' with (count == required)
-        time_gated = dict(results["time"])
-        time_gated["passed"] = np.logical_and(results["time"]["passed"],
-                                              results["time"]["count"] == pass_count_required)
+        # If using pass_err_cnt, use results as-is
+        # If using original PASS column, apply pass_count_required filtering
+        if pass_err_cnt is not None:
+            # Using error count threshold - use results directly
+            time_gated = results["time"]
+            voltage_gated = results["voltage"]
+        else:
+            # Using original PASS column - apply pass_count_required filter
+            time_gated = dict(results["time"])
+            time_gated["passed"] = np.logical_and(results["time"]["passed"],
+                                                  results["time"]["count"] == pass_count_required)
 
-        voltage_gated = dict(results["voltage"])
-        voltage_gated["passed"] = np.logical_and(results["voltage"]["passed"],
-                                                 results["voltage"]["count"] == pass_count_required)
+            voltage_gated = dict(results["voltage"])
+            voltage_gated["passed"] = np.logical_and(results["voltage"]["passed"],
+                                                     results["voltage"]["count"] == pass_count_required)
 
         table["vendor_id"].append("0x{:04x}".format(results["vendor_id"]))
         table["device_id"].append("0x{:04x}".format(results["device_id"]))
@@ -294,10 +335,11 @@ def summarize(namespace):
 def plot(namespace):
     files = namespace.files
     save = namespace.save
+    pass_err_cnt = getattr(namespace, "pass_err_cnt", None)
 
     figs = []
     for file in files:
-        results = load_results(file)
+        results = load_results(file, pass_err_cnt=pass_err_cnt)
         fig, axes = plt.subplots(1, 2, sharey="row", figsize=(8, 3))
 
         for ax, key in zip(axes, ("time", "voltage")):
@@ -326,6 +368,10 @@ if __name__ == "__main__":
         help="Save each plot, rather than displaying",
         action="store_true",
     )
+    plot_parser.add_argument(
+        "--pass-err-cnt", type=int, default=None,
+        help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. If not specified, uses the PASS column from the data file.",
+    )
     plot_parser.add_argument("files", help="Input data file(s)", nargs="+")
     plot_parser.set_defaults(func=plot)
 
@@ -334,6 +380,10 @@ if __name__ == "__main__":
     summarize_parser.add_argument(
         "-c", "--pass-count-required", type=int, default=0,
         help="Treat a row as PASS only if Pass==1 and Count==THIS (default: 0).",
+    )
+    summarize_parser.add_argument(
+        "--pass-err-cnt", type=int, default=None,
+        help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. If not specified, uses the PASS column from the data file.",
     )
     summarize_parser.add_argument("files", help="Input data file(s)", nargs="+")
     summarize_parser.set_defaults(func=summarize)

@@ -174,6 +174,7 @@ def parse_summary_file(path: str, omit_zero_data: bool = False) -> List[Dict[str
             vendor = int(vendor_s, 16) if vendor_s.lower().startswith("0x") else int(vendor_s)
             device = int(device_s, 16) if device_s.lower().startswith("0x") else int(device_s)
             lane = int(lane_s)
+            # Keep width in %UI as read from file
             width = float(width_s)
             height = float(height_s)
         except Exception:
@@ -197,7 +198,7 @@ def parse_summary_file(path: str, omit_zero_data: bool = False) -> List[Dict[str
             "Lane": lane,
             "Vendor": vendor,
             "Device": device,
-            "Width": width,    # %UI
+            "Width": width,    # %UI (e.g., 28.0 = 28% of a UI)
             "Height": height,  # V
         })
     return rows
@@ -581,7 +582,7 @@ def main():
               {prog} summaries/*.txt --out stats_BRM13250002_all.txt
 
               # Enforce dataset gating and tweak PASS thresholds
-              {prog} --width-limit 12.5 --height-limit 0.085 --pass-width 30 --pass-height 0.0165 summaries/*.txt
+              {prog} --width-limit 12.5 --height-limit 0.085 --pass-width 0.28 --pass-height 0.048 summaries/*.txt
 
               # Append vendor/device names (requires pci.ids)
               {prog} --names --pci-ids /path/to/pci.ids summaries/*.txt
@@ -622,10 +623,10 @@ def main():
                     help="Minimum acceptable eye width in %%UI for dataset gating (default: 0.0).")
     ap.add_argument("--height-limit", type=float, default=0.0,
                     help="Minimum acceptable eye height in V for dataset gating (default: 0.0).")
-    ap.add_argument("--pass-width", type=float, default=30.0,
-                    help="PASS threshold for width in %%UI used in summary tables (default: 30.0, PCIe Gen5 spec).")
-    ap.add_argument("--pass-height", type=float, default=0.0165,
-                    help="PASS threshold for height in V used in summary tables (default: 0.0165, PCIe Gen5 spec 15mV + tolerance).")
+    ap.add_argument("--pass-width", type=float, default=28.0,
+                    help="PASS threshold for width in %%UI used in summary tables (default: 28.0 %%UI, ~9 steps each side).")
+    ap.add_argument("--pass-height", type=float, default=0.048,
+                    help="PASS threshold for height in V used in summary tables (default: 0.048 V = 48mV, 24mV each side).")
     ap.add_argument("--omit-ports", nargs="+", default=[],
                     help="Port labels to omit from Vendor/Device stats (canonicalized: e.g., 'n07', 'N7 bridge' -> N7).")
     ap.add_argument("--omit-n7-9", action="store_true",
