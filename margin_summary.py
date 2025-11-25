@@ -232,14 +232,18 @@ def summarize(files: List[str], pass_count_required: int, pass_err_cnt: Optional
         descr = results["descr"]
         lane = results["lane"]
         if np.isnan(time_margin):
-            print(f"WARNING: {descr} lane {lane}: time margin is NaN (no valid data)", file=sys.stderr)
+            print(f"ERROR: {descr} lane {lane}: time margin is NaN (no valid data)", file=sys.stderr)
+            sys.exit(3)
         elif time_margin == 0.0:
-            print(f"WARNING: {descr} lane {lane}: time margin is 0.0", file=sys.stderr)
+            print(f"ERROR: {descr} lane {lane}: time margin is 0.0", file=sys.stderr)
+            sys.exit(3)
 
         if np.isnan(voltage_margin):
-            print(f"WARNING: {descr} lane {lane}: voltage margin is NaN (no valid data)", file=sys.stderr)
+            print(f"ERROR: {descr} lane {lane}: voltage margin is NaN (no valid data)", file=sys.stderr)
+            sys.exit(3)
         elif voltage_margin == 0.0:
-            print(f"WARNING: {descr} lane {lane}: voltage margin is 0.0", file=sys.stderr)
+            print(f"ERROR: {descr} lane {lane}: voltage margin is 0.0", file=sys.stderr)
+            sys.exit(3)
 
         table["vendor_id"].append("0x{:04x}".format(results["vendor_id"]))
         table["device_id"].append("0x{:04x}".format(results["device_id"]))
