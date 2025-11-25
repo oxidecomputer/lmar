@@ -369,8 +369,8 @@ if __name__ == "__main__":
         action="store_true",
     )
     plot_parser.add_argument(
-        "--pass-err-cnt", type=int, default=None,
-        help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. If not specified, uses the PASS column from the data file.",
+        "--pass-err-cnt", type=lambda x: None if x.lower() == 'none' else int(x), default=12,
+        help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. Default is 12 (BER9 @ 99.99%% Confidence). Use 'None' to use the PASS column from the data file instead.",
     )
     plot_parser.add_argument("files", help="Input data file(s)", nargs="+")
     plot_parser.set_defaults(func=plot)
@@ -382,8 +382,8 @@ if __name__ == "__main__":
         help="Treat a row as PASS only if Pass==1 and Count==THIS (default: 0).",
     )
     summarize_parser.add_argument(
-        "--pass-err-cnt", type=int, default=None,
-        help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. If not specified, uses the PASS column from the data file.",
+        "--pass-err-cnt", type=lambda x: None if x.lower() == 'none' else int(x), default=12,
+        help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. Default is 12 (BER9 @ 99.99%% Confidence). Use 'None' to use the PASS column from the data file instead.",
     )
     summarize_parser.add_argument("files", help="Input data file(s)", nargs="+")
     summarize_parser.set_defaults(func=summarize)

@@ -644,8 +644,8 @@ def main(argv: List[str]) -> None:
         help="Treat a row as PASS only if Pass==1 and Count==THIS (default: 0).",
     )
     parser.add_argument(
-        "--pass-err-cnt", type=int, default=None,
-        help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. If not specified, uses the PASS column from the data file.",
+        "--pass-err-cnt", type=lambda x: None if x.lower() == 'none' else int(x), default=12,
+        help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. Default is 12 (BER9 @ 99.99%% Confidence). Use 'None' to use the PASS column from the data file instead.",
     )
     parser.add_argument("--scan-root", default=None,
                         help="Scan a top directory containing board directories, "
