@@ -66,14 +66,16 @@ COSMO_MAP = {
             (0xe3, 0x0, 0x0): "Backplane",
 }
 
-def compute_margin(results: Dict[str, np.ndarray], key: str) -> float:
+def compute_margin(results: Dict[str, np.ndarray], key: str, symmetric: bool = False) -> float:
     """
     Eye diagram margin calculator:
     - Finds the contiguous PASS run centered around 0 on the independent axis.
-    - Calculates margin as 2 × min(left_edge, right_edge) from center.
-    - For time: 2 × min(abs(left), abs(right)) in %UI
-    - For voltage: 2 × min(abs(top), abs(bottom)) in V
-    - This represents the symmetric eye opening around center.
+    - Default (symmetric=False): Calculates full asymmetric eye opening (left_edge + right_edge).
+      For time: right + abs(left) in %UI
+      For voltage: top + abs(bottom) in V
+    - Symmetric mode (symmetric=True): Calculates 2 x min(left_edge, right_edge).
+      For time: 2 x min(abs(left), abs(right)) in %UI
+      For voltage: 2 x min(abs(top), abs(bottom)) in V
     """
     passed = np.asarray(results["passed"], dtype=bool)
     independent_axis = np.asarray(results[key])
@@ -126,14 +128,18 @@ def compute_margin(results: Dict[str, np.ndarray], key: str) -> float:
     if n_passes == n_points:
         return float(np.ptp(independent_axis))
 
-    # Calculate eye margin as 2 × min(left_edge, right_edge) from center
+    # Calculate eye margin
     # Left edge: distance from center to start of pass region
     # Right edge: distance from center to end of pass region
     left_edge = abs(independent_axis[start_idx] - independent_axis[center_index])
     right_edge = abs(independent_axis[end_idx] - independent_axis[center_index])
 
-    # Return 2× the minimum edge (symmetric eye opening)
-    return 2.0 * float(min(left_edge, right_edge))
+    if symmetric:
+        # Symmetric mode: 2 x min(left_edge, right_edge)
+        return 2.0 * float(min(left_edge, right_edge))
+    else:
+        # Asymmetric mode (default): full eye opening
+        return float(left_edge + right_edge)
 
 
 def load_results(file: str, pass_err_cnt: Optional[int] = None) -> Dict[str, object]:
@@ -200,7 +206,7 @@ def load_results(file: str, pass_err_cnt: Optional[int] = None) -> Dict[str, obj
     )
 
 
-def summarize(files: List[str], pass_count_required: int, pass_err_cnt: Optional[int] = None) -> str:
+def summarize(files: List[str], pass_count_required: int, pass_err_cnt: Optional[int] = None, symmetric: bool = False) -> str:
     """Return the summary table string for the provided files."""
     table = dict(vendor_id=[], device_id=[],
                  lane=[], time_margin=[], voltage_margin=[],
@@ -225,8 +231,8 @@ def summarize(files: List[str], pass_count_required: int, pass_err_cnt: Optional
             voltage_gated["passed"] = np.logical_and(results["voltage"]["passed"],
                                                      results["voltage"]["count"] == pass_count_required)
 
-        time_margin = compute_margin(time_gated, "time")
-        voltage_margin = compute_margin(voltage_gated, "voltage")
+        time_margin = compute_margin(time_gated, "time", symmetric=symmetric)
+        voltage_margin = compute_margin(voltage_gated, "voltage", symmetric=symmetric)
 
         # Check for bad data and print warnings to stderr
         descr = results["descr"]
@@ -410,7 +416,7 @@ def _find_board_dir(path: str) -> Optional[str]:
 
 # ---------- Scan mode orchestration ----------
 
-def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: int, pass_err_cnt: Optional[int]) -> None:
+def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: int, pass_err_cnt: Optional[int], symmetric: bool = False) -> None:
     """Write summaries for one board directory."""
     os.makedirs(outdir, exist_ok=True)
     suffix_counter: Dict[str, int] = {}
@@ -448,7 +454,7 @@ def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: in
                 base_key = label  # e.g., 'BRM22250002_1'
                 suf = _unique_suffix(suffix_counter, base_key)
                 outname = f"margin_summary_{label}{suf}.txt"
-                text = summarize(files, pass_count_required, pass_err_cnt)
+                text = summarize(files, pass_count_required, pass_err_cnt, symmetric=symmetric)
                 outpath = os.path.join(outdir, outname)
                 with open(outpath, "w", encoding="utf-8") as fh:
                     fh.write(text + "\n")
@@ -486,7 +492,7 @@ def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: in
                 n = suffix_counter[base_key]
                 outname = f"margin_summary_{board}_{n}.txt"  # no extra suffix
 
-            text = summarize(files, pass_count_required, pass_err_cnt)
+            text = summarize(files, pass_count_required, pass_err_cnt, symmetric=symmetric)
             outpath = os.path.join(outdir, outname)
             with open(outpath, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
@@ -497,14 +503,14 @@ def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: in
             label = f"{board}_plain"
             suf = _unique_suffix(suffix_counter, label)
             outname = f"margin_summary_{label}{suf}.txt"
-            text = summarize(top_plain, pass_count_required, pass_err_cnt)
+            text = summarize(top_plain, pass_count_required, pass_err_cnt, symmetric=symmetric)
             outpath = os.path.join(outdir, outname)
             with open(outpath, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
             print(f"Wrote {outpath}")
 
 
-def scan_and_write(scan_root: str, outdir: str, pass_count_required: int, pass_err_cnt: Optional[int]) -> None:
+def scan_and_write(scan_root: str, outdir: str, pass_count_required: int, pass_err_cnt: Optional[int], symmetric: bool = False) -> None:
     os.makedirs(outdir, exist_ok=True)
 
     # Support scan_root being either a single board dir or a parent of many board dirs.
@@ -524,12 +530,12 @@ def scan_and_write(scan_root: str, outdir: str, pass_count_required: int, pass_e
         sys.exit(2)
 
     for board, board_dir in board_map.items():
-        _scan_board(board, board_dir, outdir, pass_count_required, pass_err_cnt)
+        _scan_board(board, board_dir, outdir, pass_count_required, pass_err_cnt, symmetric=symmetric)
 
 
 # ---------- Direct mode (per-archive outputs; keep tempdir alive) ----------
 
-def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_count_required: int, pass_err_cnt: Optional[int]) -> None:
+def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_count_required: int, pass_err_cnt: Optional[int], symmetric: bool = False) -> None:
     """Produce summaries for given inputs. Each archive/dataset -> its own file."""
     os.makedirs(outdir, exist_ok=True)
 
@@ -609,7 +615,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
             if len(datasets) != 1:
                 print("--out may be used only when exactly one dataset is provided.", file=sys.stderr)
                 sys.exit(2)
-            text = summarize(datasets[0][1], pass_count_required, pass_err_cnt)
+            text = summarize(datasets[0][1], pass_count_required, pass_err_cnt, symmetric=symmetric)
             out_full = out_path if os.path.isabs(out_path) else os.path.join(outdir, out_path)
             with open(out_full, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
@@ -629,7 +635,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
                 suf = _unique_suffix(suffix_counter, name_key)
                 outname = f"margin_summary_{name_key}{suf}.txt"
 
-            text = summarize(files, pass_count_required, pass_err_cnt)
+            text = summarize(files, pass_count_required, pass_err_cnt, symmetric=symmetric)
             outpath = os.path.join(outdir, outname)
             with open(outpath, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
@@ -651,6 +657,10 @@ def main(argv: List[str]) -> None:
         "--pass-err-cnt", type=lambda x: None if x.lower() == 'none' else int(x), default=12,
         help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. Default is 12 (BER9 @ 99.99%% Confidence). Use 'None' to use the PASS column from the data file instead.",
     )
+    parser.add_argument(
+        "--sym-eye-calc", action="store_true",
+        help="Use symmetric eye calculation based on min(left,right)/min(top,bot) instead of default asymmetric calculation.",
+    )
     parser.add_argument("--scan-root", default=None,
                         help="Scan a top directory containing board directories, "
                              "or a single board directory (e.g., BRM13250010).")
@@ -666,13 +676,13 @@ def main(argv: List[str]) -> None:
     if ns.scan_root:
         if ns.inputs:
             print("Ignore positional inputs when using --scan-root.", file=sys.stderr)
-        scan_and_write(ns.scan_root, ns.outdir, ns.pass_count_required, ns.pass_err_cnt)
+        scan_and_write(ns.scan_root, ns.outdir, ns.pass_count_required, ns.pass_err_cnt, symmetric=ns.sym_eye_calc)
         return
 
     if not ns.inputs:
         parser.error("either provide positional inputs or use --scan-root")
 
-    direct_mode(ns.inputs, ns.outdir, ns.out, ns.pass_count_required, ns.pass_err_cnt)
+    direct_mode(ns.inputs, ns.outdir, ns.out, ns.pass_count_required, ns.pass_err_cnt, symmetric=ns.sym_eye_calc)
 
 
 if __name__ == "__main__":

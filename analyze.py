@@ -111,10 +111,10 @@ def compute_margin(results, key) -> float:
     """
     Eye diagram margin calculator:
     - Finds the contiguous PASS run centered around 0 on the independent axis.
-    - Calculates margin as 2 × min(left_edge, right_edge) from center.
-    - For time: 2 × min(abs(left), abs(right)) in %UI
-    - For voltage: 2 × min(abs(top), abs(bottom)) in V
-    - This represents the symmetric eye opening around center.
+    - Calculates margin as left_edge + right_edge (full asymmetric eye opening).
+    - For time: right + abs(left) in %UI
+    - For voltage: top + abs(bottom) in V
+    - This represents the total eye opening across center.
     """
     passed = np.asarray(results["passed"], dtype=bool)
     independent_axis = np.asarray(results[key])
@@ -167,14 +167,14 @@ def compute_margin(results, key) -> float:
     if n_passes == n_points:
         return float(np.ptp(independent_axis))
 
-    # Calculate eye margin as 2 × min(left_edge, right_edge) from center
+    # Calculate eye margin as left_edge + right_edge (full asymmetric eye opening)
     # Left edge: distance from center to start of pass region
     # Right edge: distance from center to end of pass region
     left_edge = abs(independent_axis[start_idx] - independent_axis[center_index])
     right_edge = abs(independent_axis[end_idx] - independent_axis[center_index])
 
-    # Return 2× the minimum edge (symmetric eye opening)
-    return 2.0 * float(min(left_edge, right_edge))
+    # Return full eye opening (asymmetric calculation)
+    return float(left_edge + right_edge)
 
 
 def load_results(file: str, pass_err_cnt: int | None = None) -> dict[dict]:
