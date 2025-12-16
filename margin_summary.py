@@ -33,6 +33,7 @@ import zipfile
 import tarfile
 import tempfile
 from typing import List, Dict, Tuple, Optional
+import shutil
 
 # Keep the same COSMO_MAP and parsing style from analyze.py (unchanged).
 COSMO_MAP = {
@@ -200,11 +201,34 @@ def load_results(file: str, pass_err_cnt: Optional[int] = None) -> Dict[str, obj
     )
 
 
-def summarize(files: List[str], pass_count_required: int, pass_err_cnt: Optional[int] = None) -> str:
-    """Return the summary table string for the provided files."""
+def summarize(files: List[str], pass_count_required: int, pass_err_cnt: Optional[int] = None,
+              test_mode: bool = False, archive_path: Optional[str] = None,
+              limits: Optional[Tuple[float, float]] = None) -> str:
+    """Return the summary table string for the provided files.
+
+    Args:
+        files: List of margin-results files to process
+        pass_count_required: Pass count filter (when not using pass_err_cnt)
+        pass_err_cnt: Error count threshold for PASS determination
+        test_mode: Enable test mode features (BDFL columns, NaN file extraction)
+        archive_path: Original archive path if files came from an archive
+        limits: Optional (width_limit_UI, height_limit_V) tuple for PASS/FAIL determination
+    """
     table = dict(vendor_id=[], device_id=[],
                  lane=[], time_margin=[], voltage_margin=[],
                  descr=[])
+
+    if test_mode:
+        table['bdf'] = []
+
+    if limits:
+        table['pass'] = []
+        width_limit, height_limit = limits
+
+    # Track statistics for summary message
+    total_lanes = 0
+    nan_count = 0
+    expected_lanes = 96
 
     for file in files:
         results = load_results(file, pass_err_cnt=pass_err_cnt)
@@ -231,15 +255,36 @@ def summarize(files: List[str], pass_count_required: int, pass_err_cnt: Optional
         # Check for bad data and print warnings to stderr
         descr = results["descr"]
         lane = results["lane"]
+        bus = results["bus"]
+        dev = results["dev"]
+        func = results["func"]
+        bdf_str = f"{bus:02x}/{dev:x}/{func:x}"
+        has_nan = False
+
+        total_lanes += 1
+
         if np.isnan(time_margin):
-            print(f"WARNING: {descr} lane {lane}: time margin is NaN (no valid data)", file=sys.stderr)
+            print(f"WARNING: {descr}, {bdf_str}, lane {lane}: time margin is NaN (no valid data)", file=sys.stderr)
+            has_nan = True
         elif time_margin == 0.0:
-            print(f"WARNING: {descr} lane {lane}: time margin is 0.0", file=sys.stderr)
+            print(f"WARNING: {descr}, {bdf_str}, lane {lane}: time margin is 0.0", file=sys.stderr)
 
         if np.isnan(voltage_margin):
-            print(f"WARNING: {descr} lane {lane}: voltage margin is NaN (no valid data)", file=sys.stderr)
+            print(f"WARNING: {descr}, {bdf_str}, lane {lane}: voltage margin is NaN (no valid data)", file=sys.stderr)
+            has_nan = True
         elif voltage_margin == 0.0:
-            print(f"WARNING: {descr} lane {lane}: voltage margin is 0.0", file=sys.stderr)
+            print(f"WARNING: {descr}, {bdf_str}, lane {lane}: voltage margin is 0.0", file=sys.stderr)
+
+        if has_nan:
+            nan_count += 1
+
+        # Extract problem files from archives and show location
+        if has_nan:
+            if archive_path:
+                _extract_problem_file(archive_path, file)
+            else:
+                # Plain file - just show its location
+                print(f"  Problem file location: {file}", file=sys.stderr)
 
         table["vendor_id"].append("0x{:04x}".format(results["vendor_id"]))
         table["device_id"].append("0x{:04x}".format(results["device_id"]))
@@ -248,19 +293,72 @@ def summarize(files: List[str], pass_count_required: int, pass_err_cnt: Optional
         table["time_margin"].append(time_margin)
         table["voltage_margin"].append(voltage_margin)
 
-    headers = (
+        # TEST MODE: Add B/D/F column
+        if test_mode:
+            table["bdf"].append(bdf_str)
+
+        # LIMITS: Add PASS column
+        if limits:
+            # Check if both margins meet limits (handle NaN as fail)
+            time_pass = not np.isnan(time_margin) and time_margin >= width_limit
+            voltage_pass = not np.isnan(voltage_margin) and voltage_margin >= height_limit
+            overall_pass = time_pass and voltage_pass
+            table["pass"].append("Y" if overall_pass else "N")
+
+    # Print summary of dataset processing
+    print(f"Lanes Processed: {total_lanes}", file=sys.stderr)
+    if total_lanes < expected_lanes:
+        print(f"WARNING: Processed lanes {total_lanes} < expected of {expected_lanes} for full sled", file=sys.stderr)
+
+    # Build headers based on mode and options
+    headers = [
         "Vendor ID",
         "Device ID",
         "Lane",
         "Time margin (% UI)",
         "Voltage margin (V)",
         "Description",
-    )
+    ]
+
+    if test_mode:
+        headers.append("B/D/F")
+
+    if limits:
+        headers.append("PASS")
+
+    headers = tuple(headers)
 
     return tabulate(table, headers=headers)
 
 
 # ---------- File collection helpers ----------
+
+def _extract_problem_file(archive_path: str, temp_file_path: str) -> None:
+    """Extract a problem file from an archive to the archive's directory.
+
+    Args:
+        archive_path: Path to the original archive (.zip or .tar*)
+        temp_file_path: Path to the file in the temporary extraction directory
+    """
+    # Determine the filename from the temp path
+    filename = os.path.basename(temp_file_path)
+    archive_dir = os.path.dirname(archive_path)
+    base_output_path = os.path.join(archive_dir, filename)
+
+    # Find a unique filename if it already exists (.1, .2, .3, etc.)
+    output_path = base_output_path
+    counter = 1
+    while os.path.exists(output_path):
+        output_path = f"{base_output_path}.{counter}"
+        counter += 1
+
+    # Copy the file from temp directory to archive directory
+    try:
+        shutil.copy2(temp_file_path, output_path)
+        print(f"  Extracted problem file to: {output_path}", file=sys.stderr)
+    except Exception as e:
+        print(f"  WARNING: Failed to extract problem file: {e}", file=sys.stderr)
+
 
 def _basename(name: str) -> str:
     return os.path.basename(name).rstrip("/")
@@ -406,7 +504,7 @@ def _find_board_dir(path: str) -> Optional[str]:
 
 # ---------- Scan mode orchestration ----------
 
-def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: int, pass_err_cnt: Optional[int]) -> None:
+def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: int, pass_err_cnt: Optional[int], test_mode: bool = False, limits: Optional[Tuple[float, float]] = None) -> None:
     """Write summaries for one board directory."""
     os.makedirs(outdir, exist_ok=True)
     suffix_counter: Dict[str, int] = {}
@@ -424,27 +522,27 @@ def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: in
             # Gather plain margin-results files directly within run dir
             plain = collect_plain_files(this_dir)
 
-            datasets: List[Tuple[str, List[str]]] = []  # (label, files)
+            datasets: List[Tuple[str, List[str], Optional[str]]] = []  # (label, files, archive_path)
 
             # Each archive is a separate dataset
             for arch in archives:
                 files = collect_from_archive(arch, tmpdir)
                 if files:
-                    datasets.append((f"{board}_{run}", files))
+                    datasets.append((f"{board}_{run}", files, arch))
 
             # Plain files (if any) are their own dataset
             if plain:
-                datasets.append((f"{board}_{run}", plain))
+                datasets.append((f"{board}_{run}", plain, None))
 
             if not datasets:
                 continue
 
             # If multiple datasets share same '<board>_<run>' label, suffix _2, _3, ...
-            for label, files in datasets:
+            for label, files, archive_path in datasets:
                 base_key = label  # e.g., 'BRM22250002_1'
                 suf = _unique_suffix(suffix_counter, base_key)
                 outname = f"margin_summary_{label}{suf}.txt"
-                text = summarize(files, pass_count_required, pass_err_cnt)
+                text = summarize(files, pass_count_required, pass_err_cnt, test_mode=test_mode, archive_path=archive_path, limits=limits)
                 outpath = os.path.join(outdir, outname)
                 with open(outpath, "w", encoding="utf-8") as fh:
                     fh.write(text + "\n")
@@ -482,7 +580,7 @@ def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: in
                 n = suffix_counter[base_key]
                 outname = f"margin_summary_{board}_{n}.txt"  # no extra suffix
 
-            text = summarize(files, pass_count_required, pass_err_cnt)
+            text = summarize(files, pass_count_required, pass_err_cnt, test_mode=test_mode, archive_path=arch, limits=limits)
             outpath = os.path.join(outdir, outname)
             with open(outpath, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
@@ -493,14 +591,14 @@ def _scan_board(board: str, board_dir: str, outdir: str, pass_count_required: in
             label = f"{board}_plain"
             suf = _unique_suffix(suffix_counter, label)
             outname = f"margin_summary_{label}{suf}.txt"
-            text = summarize(top_plain, pass_count_required, pass_err_cnt)
+            text = summarize(top_plain, pass_count_required, pass_err_cnt, test_mode=test_mode, archive_path=None, limits=limits)
             outpath = os.path.join(outdir, outname)
             with open(outpath, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
             print(f"Wrote {outpath}")
 
 
-def scan_and_write(scan_root: str, outdir: str, pass_count_required: int, pass_err_cnt: Optional[int]) -> None:
+def scan_and_write(scan_root: str, outdir: str, pass_count_required: int, pass_err_cnt: Optional[int], test_mode: bool = False, limits: Optional[Tuple[float, float]] = None) -> None:
     os.makedirs(outdir, exist_ok=True)
 
     # Support scan_root being either a single board dir or a parent of many board dirs.
@@ -520,17 +618,17 @@ def scan_and_write(scan_root: str, outdir: str, pass_count_required: int, pass_e
         sys.exit(2)
 
     for board, board_dir in board_map.items():
-        _scan_board(board, board_dir, outdir, pass_count_required, pass_err_cnt)
+        _scan_board(board, board_dir, outdir, pass_count_required, pass_err_cnt, test_mode=test_mode, limits=limits)
 
 
 # ---------- Direct mode (per-archive outputs; keep tempdir alive) ----------
 
-def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_count_required: int, pass_err_cnt: Optional[int]) -> None:
+def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_count_required: int, pass_err_cnt: Optional[int], test_mode: bool = False, limits: Optional[Tuple[float, float]] = None) -> None:
     """Produce summaries for given inputs. Each archive/dataset -> its own file."""
     os.makedirs(outdir, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="margin_summary_direct_") as tmpdir:
-        datasets: List[Tuple[str, List[str], str]] = []  # (logical_key, files, name_key)
+        datasets: List[Tuple[str, List[str], str, Optional[str]]] = []  # (logical_key, files, name_key, archive_path)
 
         # Collect datasets (extract into tmpdir)
         for path in inputs:
@@ -554,7 +652,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
                             else:
                                 key = f"{board}_auto"
                                 name_key = key
-                            datasets.append((key, files, name_key))
+                            datasets.append((key, files, name_key, full))
                     # plain set directly in dirpath
                     plain = collect_plain_files(dirpath)
                     if plain:
@@ -566,7 +664,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
                         else:
                             key = f"{board}_plain"
                             name_key = key
-                        datasets.append((key, plain, name_key))
+                        datasets.append((key, plain, name_key, None))
                 continue
 
             if _is_archive(path):
@@ -581,7 +679,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
                     else:
                         key = f"{board}_auto"
                         name_key = key
-                    datasets.append((key, files, name_key))
+                    datasets.append((key, files, name_key, path))
                 continue
 
             # Plain single file (not typical): group by its parent dir
@@ -594,7 +692,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
                 else:
                     key = f"{board}_plain"
                     name_key = key
-                datasets.append((key, [path], name_key))
+                datasets.append((key, [path], name_key, None))
 
         if not datasets:
             print("No margin-results datasets found in inputs.", file=sys.stderr)
@@ -605,7 +703,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
             if len(datasets) != 1:
                 print("--out may be used only when exactly one dataset is provided.", file=sys.stderr)
                 sys.exit(2)
-            text = summarize(datasets[0][1], pass_count_required, pass_err_cnt)
+            text = summarize(datasets[0][1], pass_count_required, pass_err_cnt, test_mode=test_mode, archive_path=datasets[0][3], limits=limits)
             out_full = out_path if os.path.isabs(out_path) else os.path.join(outdir, out_path)
             with open(out_full, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
@@ -614,7 +712,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
 
         # Otherwise, write auto-named files per dataset (while tmpdir exists)
         suffix_counter: Dict[str, int] = {}
-        for key, files, name_key in datasets:
+        for key, files, name_key, archive_path in datasets:
             # name_key looks like '<BOARD>_<RUN>' or '<BOARD>_plain' or '<BOARD>_auto'
             if name_key.endswith("_auto"):
                 # auto-numbered per board: ..._<n>.txt (no extra suffix)
@@ -625,7 +723,7 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
                 suf = _unique_suffix(suffix_counter, name_key)
                 outname = f"margin_summary_{name_key}{suf}.txt"
 
-            text = summarize(files, pass_count_required, pass_err_cnt)
+            text = summarize(files, pass_count_required, pass_err_cnt, test_mode=test_mode, archive_path=archive_path, limits=limits)
             outpath = os.path.join(outdir, outname)
             with open(outpath, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
@@ -654,21 +752,29 @@ def main(argv: List[str]) -> None:
                         help="Directory to write summary files (used in all modes).")
     parser.add_argument("--out", default=None,
                         help="Write a single summary to this file path (only if exactly one dataset).")
+    parser.add_argument("--test", action="store_true",
+                        help="Enable test mode: add Bus/Device/Function/Lane columns to output for traceability.")
+    parser.add_argument("--limits", nargs=2, type=float, metavar=('WIDTH_UI', 'HEIGHT_V'),
+                        help="Add PASS column based on limits: WIDTH in %%UI (e.g., 28.0), HEIGHT in V (e.g., 0.048). "
+                             "Lane passes if Time margin >= WIDTH and Voltage margin >= HEIGHT.")
     parser.add_argument("inputs", nargs="*",
                         help="Direct mode: input files/dirs/archives to summarize. "
                              "If omitted, you must use --scan-root.")
     ns = parser.parse_args(argv)
 
+    # Parse limits into tuple if provided
+    limits = tuple(ns.limits) if ns.limits else None
+
     if ns.scan_root:
         if ns.inputs:
             print("Ignore positional inputs when using --scan-root.", file=sys.stderr)
-        scan_and_write(ns.scan_root, ns.outdir, ns.pass_count_required, ns.pass_err_cnt)
+        scan_and_write(ns.scan_root, ns.outdir, ns.pass_count_required, ns.pass_err_cnt, test_mode=ns.test, limits=limits)
         return
 
     if not ns.inputs:
         parser.error("either provide positional inputs or use --scan-root")
 
-    direct_mode(ns.inputs, ns.outdir, ns.out, ns.pass_count_required, ns.pass_err_cnt)
+    direct_mode(ns.inputs, ns.outdir, ns.out, ns.pass_count_required, ns.pass_err_cnt, test_mode=ns.test, limits=limits)
 
 
 if __name__ == "__main__":
