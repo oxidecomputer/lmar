@@ -178,9 +178,14 @@ struct Args {
     #[clap(short, long)]
     probe: bool,
 
-    /// Scan ports sequentially when probing (-p). By default, scanning is parallel.
+    /// Scan ports sequentially when probing (-p). By default, scanning is
+    /// parallel.
     #[clap(short = 's', long = "seq-scan")]
     seq_scan: bool,
+
+    /// Run a 4-point test
+    #[clap(short = '4', long = "four-point")]
+    four_point: bool,
 
     /// Create a zip of the output directory (single-target mode only).
     ///
@@ -1631,6 +1636,17 @@ pub struct MarginingLimits {
     pub sampling_rate_timing: u8,
 }
 
+impl MarginingLimits {
+    pub fn set_timing_steps(&mut self, steps: u8) {
+        self.num_timing_steps = steps;
+    }
+    pub fn set_voltage_steps(&mut self, steps: u8) {
+        if self.num_voltage_steps.is_some() {
+            self.num_voltage_steps.replace(steps);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct LaneMargin {
     inner: LaneMarginInner,
@@ -2562,8 +2578,6 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
     let mut file = File::create(f)?;
     file.write_all(&devs.stdout)?;
 
-
-
     if args.seq_scan {
         // Sequential scan (legacy behavior on request)
         for b in bridges.into_iter() {
@@ -2611,7 +2625,11 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
             }
         }
         if failed {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "one or more ports failed").into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "one or more ports failed",
+            )
+            .into());
         }
     }
 
@@ -2677,6 +2695,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let lanes = args.lanes.to_indices(&link_status)?;
+
     if args.verbose >= verbosity::PROGRESS_SUMMARY {
         println!("lmar: margining lanes: {lanes:?}");
     }
@@ -2699,7 +2718,6 @@ fn main() -> anyhow::Result<()> {
         println!("Created {}", zipfile.display());
     }
 
-
     Ok(())
 }
 
@@ -2710,7 +2728,13 @@ fn run_margin(
     receiver: Receiver,
     args: &Args,
 ) -> Result<()> {
-    let duration = Duration::from_secs_f64(args.duration.max(0.200));
+    let duration;
+
+    if args.four_point {
+        duration = Duration::from_secs_f64(330.0);
+    } else {
+        duration = Duration::from_secs_f64(args.duration.max(0.200));
+    }
     if args.verbose >= verbosity::MARGIN_DURATION {
         println!("lmar: margin duration {:?}", duration);
     }
@@ -2764,16 +2788,31 @@ fn run_margin(
         let error_count = args.error_count;
         let timing = args.timing;
         let voltage = args.voltage;
-        let thr = thread::spawn(move || {
-            margin_lane(margin, duration, error_count, timing, voltage, tx_)
-        });
+
+        let thr;
+        if args.four_point {
+            thr = thread::spawn(move || {
+                four_point(margin, duration, error_count, timing, voltage, tx_)
+            });
+        } else {
+            thr = thread::spawn(move || {
+                margin_lane(margin, duration, error_count, timing, voltage, tx_)
+            });
+        }
+
         if args.verbose >= verbosity::FILENAME {
             println!("lmar: saving lane {} to \"{}\"", lane, filename);
         }
 
         // Insert a small delay between each lane. This is not strictly
         // necessary, but may help improve throughput a bit.
-        thread::sleep(duration / lanes.len() as u32);
+        if args.four_point {
+            thread::sleep(Duration::from_secs(1 + lanes.len() as u64));
+            margining_limits.unwrap().set_timing_steps(2);
+            margining_limits.unwrap().set_voltage_steps(2);
+        } else {
+            thread::sleep(duration / lanes.len() as u32);
+        }
 
         // Set up the progress bars for this lane, if the verbosity level
         // requires it.
@@ -3025,6 +3064,114 @@ fn margin_lane(
             margin.clear_error_log()?;
             margin.go_to_normal_settings()?;
             margin.no_command()?;
+
+            // Compute the actual voltage at which we're margining.
+            let sign = if matches!(step.direction, Some(UpDown::Down)) {
+                -1.0
+            } else {
+                1.0
+            };
+            let point = MarginPoint::Voltage(
+                sign * voltage_resolution * f64::from(step.steps.0),
+            );
+            let (margin_duration, result) = margin
+                .margin_at_up_down(step, duration)
+                .context(format!("Failed to margin point: {step:?}"))?;
+            tx.send(MarginUpdate {
+                lane,
+                point,
+                duration: margin_duration,
+                result,
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn four_point(
+    margin: LaneMargin,
+    duration: Duration,
+    error_count: Option<u8>,
+    timing: bool,
+    voltage: bool,
+    tx: mpsc::Sender<MarginUpdate>,
+) -> anyhow::Result<()> {
+    let lane = margin.lane();
+    let capabilities = margin.capabilities();
+    let limits = margin.limits();
+
+    // Compute the resolution in both dimensions.
+    let timing_resolution: f64 = f64::from(limits.max_timing_offset)
+        / f64::from(limits.num_timing_steps);
+    let voltage_resolution: f64 = if capabilities.voltage_supported {
+        (f64::from(limits.max_voltage_offset.unwrap())
+            / f64::from(limits.num_voltage_steps.unwrap()))
+            / 100.0
+    } else {
+        0.0
+    };
+
+    // For a four-point test we need to go a certain distance to each side of
+    // the centre and dwell there to see how many errors we encounter.
+
+    if timing {
+        let mut steps = vec![StepLeftRight {
+            direction: Some(LeftRight::Left),
+            steps: Steps::from(3),
+        }];
+        if margin.capabilities().independent_left_right_sampling {
+            steps.push(StepLeftRight {
+                direction: Some(LeftRight::Right),
+                steps: Steps::from(3),
+            });
+        }
+
+        for step in steps.into_iter() {
+            margin.clear_error_log()?;
+            margin.go_to_normal_settings()?;
+            margin.no_command()?;
+            //margin.set_error_count_limit(error_count.unwrap_or(5)).unwrap();
+
+            let sign = if matches!(step.direction, Some(LeftRight::Left)) {
+                -1.0
+            } else {
+                1.0
+            };
+            let point = MarginPoint::Time(
+                sign * timing_resolution * f64::from(step.steps.0),
+            );
+            let (margin_duration, result) = margin
+                .margin_at_left_right(step, duration)
+                .context(format!("Failed to margin point: {step:?}"))?;
+            tx.send(MarginUpdate {
+                lane,
+                point,
+                duration: margin_duration,
+                result,
+            })?;
+        }
+    }
+
+    // Iterate over the voltage steps, if supported.
+    if voltage {
+        let mut steps = vec![StepUpDown {
+            direction: Some(UpDown::Up),
+            steps: Steps::from(2),
+        }];
+
+        if margin.capabilities().independent_up_down_voltage {
+            steps.push(StepUpDown {
+                direction: Some(UpDown::Down),
+                steps: Steps::from(2),
+            });
+        }
+        for step in steps.into_iter() {
+            // Set up per the spec for margining a single point.
+            margin.clear_error_log()?;
+            margin.go_to_normal_settings()?;
+            margin.no_command()?;
+            //margin.set_error_count_limit(error_count.unwrap_or(5)).unwrap();
 
             // Compute the actual voltage at which we're margining.
             let sign = if matches!(step.direction, Some(UpDown::Down)) {
