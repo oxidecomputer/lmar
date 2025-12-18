@@ -162,6 +162,34 @@ def load_results(file: str, pass_err_cnt: Optional[int] = None) -> Dict[str, obj
 
     # Load the table body (tab-separated) skipping the 3 header lines + 1 blank
     results = np.loadtxt(file, skiprows=4, delimiter="\t")
+
+    # Handle empty files (header only, no data rows)
+    if results.size == 0 or results.ndim == 1:
+        # Return empty results that will yield NaN margins
+        time_results = dict(
+            time=np.array([]),
+            count=np.array([], dtype=np.int64),
+            duration=np.array([]),
+            passed=np.array([], dtype=bool),
+            xlabel="Time (% UI)",
+        )
+        voltage_results = dict(
+            voltage=np.array([]),
+            count=np.array([], dtype=np.int64),
+            duration=np.array([]),
+            passed=np.array([], dtype=bool),
+            xlabel="Voltage (V)",
+        )
+        return dict(
+            vendor_id=vendor_id,
+            device_id=device_id,
+            bus=bus, dev=dev, func=func,
+            descr=descr,
+            lane=lane,
+            time=time_results,
+            voltage=voltage_results,
+        )
+
     (time, voltage, duration, count, passed_col) = range(5)
     is_time = results[:, time] != 0
     is_voltage = np.logical_not(is_time)
@@ -477,6 +505,23 @@ def _parse_run_from_name(basename_noext: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _parse_timestamp_from_name(name: str) -> Optional[str]:
+    """
+    Extract HH-MM-SS from names containing 1986-MM-DDTHH-MM-SS pattern.
+    Uses 1986 as anchor (system startup time). Works with suffixes like -1.zip, _info.zip.
+
+    Examples:
+        margin-1986-12-28T21-50-48.zip -> "21-50-48"
+        margin-1986-12-28T21-50-48-1.zip -> "21-50-48"
+        margin-1986-12-28T21-50-48_info.zip -> "21-50-48"
+    """
+    # Look for 1986-MM-DDTHH-MM-SS pattern (8 chars for HH-MM-SS after T)
+    match = re.search(r'1986-\d{2}-\d{2}T(\d{2}-\d{2}-\d{2})', name)
+    if match:
+        return match.group(1)  # Return just HH-MM-SS
+    return None
+
+
 def _unique_suffix(counter: Dict[str, int], key: str) -> str:
     """
     Manage suffixes _2, _3, ... per key (usually '<BOARD>_<RUN>' or '<BOARD>_plain' or '<BOARD>_auto').
@@ -645,20 +690,33 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
                                 continue
                             board = _find_board_dir(full) or "BOARD"
                             parent = os.path.basename(os.path.dirname(full))
-                            run = parent if _is_run_dir(parent) else _parse_run_from_name(_remove_archive_ext(_basename(full)))
-                            if run is not None:
-                                key = f"{board}_{run}"
+
+                            # Try timestamp first, then run number, then auto
+                            timestamp = _parse_timestamp_from_name(_basename(full))
+                            if timestamp:
+                                key = f"{board}_{timestamp}"
                                 name_key = key
                             else:
-                                key = f"{board}_auto"
-                                name_key = key
+                                run = parent if _is_run_dir(parent) else _parse_run_from_name(_remove_archive_ext(_basename(full)))
+                                if run is not None:
+                                    key = f"{board}_{run}"
+                                    name_key = key
+                                else:
+                                    key = f"{board}_auto"
+                                    name_key = key
                             datasets.append((key, files, name_key, full))
                     # plain set directly in dirpath
                     plain = collect_plain_files(dirpath)
                     if plain:
                         board = _find_board_dir(dirpath) or "BOARD"
                         parent = os.path.basename(dirpath)
-                        if _is_run_dir(parent):
+
+                        # Try timestamp first, then run number, then plain
+                        timestamp = _parse_timestamp_from_name(parent)
+                        if timestamp:
+                            key = f"{board}_{timestamp}"
+                            name_key = key
+                        elif _is_run_dir(parent):
                             key = f"{board}_{parent}"
                             name_key = key
                         else:
@@ -672,13 +730,20 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
                 if files:
                     board = _find_board_dir(path) or "BOARD"
                     parent = os.path.basename(os.path.dirname(path))
-                    run = parent if _is_run_dir(parent) else _parse_run_from_name(_remove_archive_ext(_basename(path)))
-                    if run is not None:
-                        key = f"{board}_{run}"
+
+                    # Try timestamp first, then run number, then auto
+                    timestamp = _parse_timestamp_from_name(_basename(path))
+                    if timestamp:
+                        key = f"{board}_{timestamp}"
                         name_key = key
                     else:
-                        key = f"{board}_auto"
-                        name_key = key
+                        run = parent if _is_run_dir(parent) else _parse_run_from_name(_remove_archive_ext(_basename(path)))
+                        if run is not None:
+                            key = f"{board}_{run}"
+                            name_key = key
+                        else:
+                            key = f"{board}_auto"
+                            name_key = key
                     datasets.append((key, files, name_key, path))
                 continue
 
@@ -686,7 +751,13 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
             if os.path.isfile(path) and _is_margin_results(path):
                 board = _find_board_dir(path) or "BOARD"
                 parent = os.path.basename(os.path.dirname(path))
-                if _is_run_dir(parent):
+
+                # Try timestamp first, then run number, then plain
+                timestamp = _parse_timestamp_from_name(parent)
+                if timestamp:
+                    key = f"{board}_{timestamp}"
+                    name_key = key
+                elif _is_run_dir(parent):
                     key = f"{board}_{parent}"
                     name_key = key
                 else:
@@ -704,7 +775,21 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
                 print("--out may be used only when exactly one dataset is provided.", file=sys.stderr)
                 sys.exit(2)
             text = summarize(datasets[0][1], pass_count_required, pass_err_cnt, test_mode=test_mode, archive_path=datasets[0][3], limits=limits)
-            out_full = out_path if os.path.isabs(out_path) else os.path.join(outdir, out_path)
+
+            # Use --out path as-is; only join with outdir if it's just a filename (no path separators)
+            if os.path.isabs(out_path) or os.path.dirname(out_path):
+                out_full = out_path
+            else:
+                # Just a filename without path - use outdir
+                out_full = os.path.join(outdir, out_path)
+
+            # Check if the output path is a directory
+            if os.path.isdir(out_full):
+                print(f"ERROR: --out must be a file path, not a directory: {out_full}", file=sys.stderr)
+                print(f"  Either specify a filename: --out ./P1/summary.txt", file=sys.stderr)
+                print(f"  Or omit --out to auto-generate filenames in --outdir", file=sys.stderr)
+                sys.exit(2)
+
             with open(out_full, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
             print(f"Wrote {out_full}")
@@ -713,21 +798,140 @@ def direct_mode(inputs: List[str], outdir: str, out_path: Optional[str], pass_co
         # Otherwise, write auto-named files per dataset (while tmpdir exists)
         suffix_counter: Dict[str, int] = {}
         for key, files, name_key, archive_path in datasets:
-            # name_key looks like '<BOARD>_<RUN>' or '<BOARD>_plain' or '<BOARD>_auto'
-            if name_key.endswith("_auto"):
-                # auto-numbered per board: ..._<n>.txt (no extra suffix)
-                _ = _unique_suffix(suffix_counter, name_key)  # updates counter
-                n = suffix_counter[name_key]
-                outname = f"margin_summary_{name_key[:-5]}_{n}.txt"  # strip '_auto'
+            # name_key looks like '<BOARD>_<timestamp>' or '<BOARD>_<RUN>' or '<BOARD>_plain' or '<BOARD>_auto'
+            # Split into board and identifier
+            if '_' in name_key:
+                parts = name_key.rsplit('_', 1)  # Split on last underscore
+                board_part = parts[0]
+                id_part = parts[1]
+
+                if id_part == "auto":
+                    # auto-numbered per board: ..._<n>.txt
+                    _ = _unique_suffix(suffix_counter, name_key)  # updates counter
+                    n = suffix_counter[name_key]
+                    outname = f"{board_part}_margin_summary_{n}.txt"
+                else:
+                    # timestamp, run number, or "plain"
+                    suf = _unique_suffix(suffix_counter, name_key)
+                    outname = f"{board_part}_margin_summary_{id_part}{suf}.txt"
             else:
+                # No underscore - just use name_key as-is (shouldn't happen, but fallback)
                 suf = _unique_suffix(suffix_counter, name_key)
-                outname = f"margin_summary_{name_key}{suf}.txt"
+                outname = f"{name_key}_margin_summary{suf}.txt"
 
             text = summarize(files, pass_count_required, pass_err_cnt, test_mode=test_mode, archive_path=archive_path, limits=limits)
             outpath = os.path.join(outdir, outname)
             with open(outpath, "w", encoding="utf-8") as fh:
                 fh.write(text + "\n")
             print(f"Wrote {outpath}")
+
+
+# ---------- Deep scan mode ----------
+
+def deep_scan_mode(input_dir: str, outdir: str, pass_count_required: int,
+                   pass_err_cnt: Optional[int], test_mode: bool,
+                   limits: Optional[Tuple[float, float]], inspect: bool) -> None:
+    """
+    Deep scan mode: traverse directory tree from input_dir, collect all datasets,
+    name outputs based on full path components + timestamp.
+
+    Output naming: <component1>_<component2>_..._<HH-MM-SS>.txt
+    Example: ./2WJV75RW/P6/margin-1986-12-28T21-50-48.zip -> 2WJV75RW_P6_21-50-48.txt
+    """
+    os.makedirs(outdir, exist_ok=True)
+    input_abs = os.path.abspath(input_dir)
+
+    with tempfile.TemporaryDirectory(prefix="margin_summary_deep_") as tmpdir:
+        datasets: List[Tuple[str, List[str], Optional[str]]] = []  # (output_name, files, archive_path)
+        suffix_counter: Dict[str, int] = {}
+
+        # Walk the tree
+        for dirpath, dirnames, filenames in os.walk(input_abs):
+            # Check archives in this directory
+            for fn in sorted(filenames):
+                full = os.path.join(dirpath, fn)
+                if os.path.isfile(full) and _is_archive(full):
+                    files = collect_from_archive(full, tmpdir)
+                    if not files:
+                        continue
+
+                    # Build output name from path components
+                    rel_path = os.path.relpath(dirpath, input_abs)
+                    components = [c for c in rel_path.split(os.sep) if c and c != '.']
+
+                    # Extract timestamp from archive name
+                    timestamp = _parse_timestamp_from_name(fn)
+
+                    # Build name
+                    if components:
+                        name_base = "_".join(components)
+                        if timestamp:
+                            output_name = f"{name_base}_margin_summary_{timestamp}.txt"
+                        else:
+                            output_name = f"{name_base}_margin_summary.txt"
+                    else:
+                        # At root level
+                        if timestamp:
+                            output_name = f"margin_summary_{timestamp}.txt"
+                        else:
+                            stem = _remove_archive_ext(_basename(full))
+                            output_name = f"{stem}.txt"
+
+                    datasets.append((output_name, files, full))
+
+            # Check plain files directly in this directory
+            plain = collect_plain_files(dirpath)
+            if plain:
+                # For plain files, try to extract timestamp from directory name
+                rel_path = os.path.relpath(dirpath, input_abs)
+                components = [c for c in rel_path.split(os.sep) if c and c != '.']
+
+                # Try to get timestamp from directory name
+                dir_name = os.path.basename(dirpath)
+                timestamp = _parse_timestamp_from_name(dir_name)
+
+                # If timestamp was found in the directory name itself, exclude that directory from components
+                if timestamp and components and _parse_timestamp_from_name(components[-1]):
+                    components = components[:-1]
+
+                # Build name
+                if components:
+                    name_base = "_".join(components)
+                    if timestamp:
+                        output_name = f"{name_base}_margin_summary_{timestamp}.txt"
+                    else:
+                        output_name = f"{name_base}_margin_summary.txt"
+                else:
+                    if timestamp:
+                        output_name = f"margin_summary_{timestamp}.txt"
+                    else:
+                        output_name = "margin_summary_plain.txt"
+
+                datasets.append((output_name, plain, None))
+
+        if not datasets:
+            print("No margin-results datasets found.", file=sys.stderr)
+            sys.exit(2)
+
+        # Process datasets (handle duplicates with suffixes)
+        for output_name, files, archive_path in datasets:
+            # Handle duplicate names
+            base_name = output_name
+            suf = _unique_suffix(suffix_counter, base_name)
+            if suf:
+                # Insert suffix before .txt extension
+                output_name = output_name.replace('.txt', f'{suf}.txt')
+
+            text = summarize(files, pass_count_required, pass_err_cnt,
+                           test_mode=test_mode, archive_path=archive_path, limits=limits)
+            outpath = os.path.join(outdir, output_name)
+
+            if inspect:
+                print(f"[PREVIEW] Would write {outpath}")
+            else:
+                with open(outpath, "w", encoding="utf-8") as fh:
+                    fh.write(text + "\n")
+                print(f"Wrote {outpath}")
 
 
 # ---------- CLI ----------
@@ -748,6 +952,13 @@ def main(argv: List[str]) -> None:
     parser.add_argument("--scan-root", default=None,
                         help="Scan a top directory containing board directories, "
                              "or a single board directory (e.g., BRM13250010).")
+    parser.add_argument("--deep-scan", action="store_true",
+                        help="Deep scan mode: recursively traverse input directory, "
+                             "name outputs using full path components + timestamp (e.g., BOARD_P6_HH-MM-SS.txt). "
+                             "Mutually exclusive with --scan-root.")
+    parser.add_argument("-i", "--inspect", action="store_true",
+                        help="Preview mode: show what would be written without creating files. "
+                             "Warnings and errors are still displayed.")
     parser.add_argument("--outdir", default=".",
                         help="Directory to write summary files (used in all modes).")
     parser.add_argument("--out", default=None,
@@ -765,14 +976,37 @@ def main(argv: List[str]) -> None:
     # Parse limits into tuple if provided
     limits = tuple(ns.limits) if ns.limits else None
 
+    # Validate mutually exclusive modes
+    if ns.scan_root and ns.deep_scan:
+        parser.error("--scan-root and --deep-scan are mutually exclusive")
+
+    # Deep scan mode
+    if ns.deep_scan:
+        if not ns.inputs:
+            parser.error("--deep-scan requires at least one input directory")
+        if len(ns.inputs) != 1:
+            parser.error("--deep-scan requires exactly one input directory")
+        if ns.out:
+            print("WARNING: --out is ignored in --deep-scan mode", file=sys.stderr)
+        deep_scan_mode(ns.inputs[0], ns.outdir, ns.pass_count_required, ns.pass_err_cnt,
+                      test_mode=ns.test, limits=limits, inspect=ns.inspect)
+        return
+
+    # Scan root mode
     if ns.scan_root:
         if ns.inputs:
             print("Ignore positional inputs when using --scan-root.", file=sys.stderr)
+        if ns.inspect:
+            print("WARNING: --inspect not supported in --scan-root mode (use --deep-scan instead)", file=sys.stderr)
         scan_and_write(ns.scan_root, ns.outdir, ns.pass_count_required, ns.pass_err_cnt, test_mode=ns.test, limits=limits)
         return
 
+    # Direct mode (default)
     if not ns.inputs:
-        parser.error("either provide positional inputs or use --scan-root")
+        parser.error("either provide positional inputs or use --scan-root or --deep-scan")
+
+    if ns.inspect:
+        print("WARNING: --inspect not fully supported in direct mode (use --deep-scan instead)", file=sys.stderr)
 
     direct_mode(ns.inputs, ns.outdir, ns.out, ns.pass_count_required, ns.pass_err_cnt, test_mode=ns.test, limits=limits)
 
