@@ -1348,8 +1348,9 @@ impl LaneMarginInner {
         &self,
         cmd: MarginCommand,
     ) -> Result<MarginResponse, Error> {
-        const WAIT_INTERVAL: Duration = Duration::from_micros(10);
-        const MAX_WAIT_TIME: Duration = Duration::from_millis(10);
+        // increased these from 10 -> 100, 250 to see if RC port failure is fixed
+        const WAIT_INTERVAL: Duration = Duration::from_micros(100);
+        const MAX_WAIT_TIME: Duration = Duration::from_millis(250);
         let now = Instant::now();
         let response = loop {
             // while now.elapsed() < MAX_WAIT_TIME {
@@ -1544,6 +1545,37 @@ impl LaneMarginInner {
     }
 
     fn margin_at(
+	&self,
+	cmd: MarginCommand,
+	duration: Duration,
+    ) -> Result<(Duration, MarginResult), Error> {
+	// Retry once on setup timeout.
+	for attempt in 0..=1 {
+	    match self.margin_at_once(cmd, duration) {
+		Ok(v) => return Ok(v),
+		Err(e) => {
+		    let msg = e.to_string();
+		    let is_setup_timeout =
+			msg.contains("Failed to finish margin setup within");
+
+		    if !is_setup_timeout || attempt == 1 {
+			return Err(e);
+		    }
+
+		    // Recover + retry.
+		    let _ = self.no_command();
+		    let _ = self.clear_error_log();
+		    let _ = self.no_command();
+		    let _ = self.go_to_normal_settings();
+		    sleep(Duration::from_millis(50));
+		}
+	    }
+	}
+	unreachable!()
+    }
+
+
+    fn margin_at_once(
         &self,
         cmd: MarginCommand,
         duration: Duration,
@@ -1554,8 +1586,11 @@ impl LaneMarginInner {
         const INTERVAL: Duration = Duration::from_millis(1);
 
         // Total duration before setup must complete
-        const TOTAL_DURATION: Duration = Duration::from_millis(200);
+        const TOTAL_DURATION: Duration = Duration::from_millis(2000);
 
+        // counters for NaN error info
+        let mut setup_polls: u32 = 0;
+        let mut last_error_count: Option<ErrorCount> = None;
         let now = Instant::now();
         loop {
             let response = self.wait_for_response(cmd)?;
@@ -1567,16 +1602,25 @@ impl LaneMarginInner {
                             "Margin failed, step execution status returned NAK"
                         )));
                         }
+
                         StepMarginExecutionStatus::Setup => {
+                            setup_polls += 1;
+                            last_error_count = Some(error_count);
+
                             if now.elapsed() > TOTAL_DURATION {
                                 return Err(Error::Margin(format!(
-                                    "Failed to finish margin setup within {:?}",
+                                    "Failed to finish margin setup within {:?} \
+                                      (polls={}, last_error_count={:?}, cmd={:?})",
                                     TOTAL_DURATION,
+                                    setup_polls,
+                                    last_error_count,
+                                    cmd,
                                 )));
                             }
                             sleep(INTERVAL);
                             continue;
                         }
+
                         StepMarginExecutionStatus::TooManyErrors => {
                             let result = MarginResult::Failed(error_count);
                             return Ok((now.elapsed(), result));
@@ -2921,11 +2965,16 @@ fn run_margin(
             }
         }
     }
-
     // Print any error messages the threads hit.
     for (lane, state) in state.into_iter() {
-        if let Err(e) = state.thr.join() {
-            eprintln!("lmar: margining lane {lane} failed: {e:?}");
+        match state.thr.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("lmar: margining lane {lane} failed: {e:#}");
+            }
+            Err(e) => {
+                eprintln!("lmar: margining lane {lane} panicked: {e:?}");
+            }
         }
     }
 

@@ -149,8 +149,9 @@ def parse_summary_file(path: str, omit_zero_data: bool = False) -> List[Dict[str
         return rows
 
     # Data starts after header + underline row (usually dashes)
+    # Accept separator lines with 6+ dash groups to handle --test and --limits columns
     i = hdr_idx + 1
-    if i < len(lines) and re.match(r"^-+\s+-+\s+-+\s+-+\s+-+\s+-+\s*$", lines[i]):
+    if i < len(lines) and re.match(r"^-+(\s+-+)+\s*$", lines[i]):
         i += 1
 
     for ln in lines[i:]:
@@ -167,7 +168,8 @@ def parse_summary_file(path: str, omit_zero_data: bool = False) -> List[Dict[str
                 continue
             cols = parts[:5] + [" ".join(parts[5:])]
         elif len(cols) > 6:
-            cols = cols[:5] + [" ".join(cols[5:])]
+            # Take only first 6 columns, ignore extras (B/D/F, PASS from --test/--limits)
+            cols = cols[:6]
 
         vendor_s, device_s, lane_s, width_s, height_s, desc = cols
         try:
