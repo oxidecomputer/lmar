@@ -362,7 +362,7 @@ def summarize(files: List[str], pass_count_required: int, pass_err_cnt: Optional
 # ---------- File collection helpers ----------
 
 def _extract_problem_file(archive_path: str, temp_file_path: str) -> None:
-    """Extract a problem file from an archive to the archive's directory.
+    """Extract a problem file from an archive to the archive's nan_sweep_files directory.
 
     Args:
         archive_path: Path to the original archive (.zip or .tar*)
@@ -371,7 +371,12 @@ def _extract_problem_file(archive_path: str, temp_file_path: str) -> None:
     # Determine the filename from the temp path
     filename = os.path.basename(temp_file_path)
     archive_dir = os.path.dirname(archive_path)
-    base_output_path = os.path.join(archive_dir, filename)
+
+    # Create nan_sweep_files subdirectory
+    nan_dir = os.path.join(archive_dir, 'nan_sweep_files')
+    os.makedirs(nan_dir, exist_ok=True)
+
+    base_output_path = os.path.join(nan_dir, filename)
 
     # Find a unique filename if it already exists (.1, .2, .3, etc.)
     output_path = base_output_path
@@ -380,7 +385,7 @@ def _extract_problem_file(archive_path: str, temp_file_path: str) -> None:
         output_path = f"{base_output_path}.{counter}"
         counter += 1
 
-    # Copy the file from temp directory to archive directory
+    # Copy the file from temp directory to nan_sweep_files directory
     try:
         shutil.copy2(temp_file_path, output_path)
         print(f"  Extracted problem file to: {output_path}", file=sys.stderr)

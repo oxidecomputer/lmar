@@ -1813,12 +1813,23 @@ impl LaneMargin {
     }
 
     pub fn iter_left_right_steps(&self) -> Vec<StepLeftRight> {
+        const EDGE_SKIP: u8 = 2;
+
         let steps = self.limits().num_timing_steps;
-        let base = 1..=steps;
+
+        // If the device reports too few steps, don't try anything.
+        let start = 1u8.saturating_add(EDGE_SKIP);
+        let end = steps.saturating_sub(EDGE_SKIP);
+        if end < start {
+            return vec![];
+        }
+
+        let base = start..=end;
         let right = base.clone().map(|pt| StepLeftRight {
             direction: Some(LeftRight::Right),
             steps: Steps::from(pt),
         });
+
         if self.capabilities().independent_left_right_sampling {
             base.rev()
                 .map(|pt| StepLeftRight {
@@ -1833,22 +1844,30 @@ impl LaneMargin {
     }
 
     pub fn iter_up_down_steps(&self) -> Vec<StepUpDown> {
+        const EDGE_SKIP: u8 = 2;
+
         match self.limits().num_voltage_steps {
             None => vec![],
             Some(steps) => {
-                let base = 1..=steps;
+                let start = 1u8.saturating_add(EDGE_SKIP);
+                let end = steps.saturating_sub(EDGE_SKIP);
+                if end < start {
+                    return vec![];
+                }
+
+                let base = start..=end;
                 let up = base.clone().map(|pt| StepUpDown {
                     direction: Some(UpDown::Up),
                     steps: Steps::from(pt),
                 });
+
                 if self.capabilities().independent_up_down_voltage {
                     base.rev()
                         .map(|pt| StepUpDown {
                             direction: Some(UpDown::Down),
                             steps: Steps::from(pt),
                         })
-                        .into_iter()
-                        .chain(up)
+                    .chain(up)
                         .collect()
                 } else {
                     up.collect()
