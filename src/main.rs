@@ -1813,18 +1813,11 @@ impl LaneMargin {
     }
 
     pub fn iter_left_right_steps(&self) -> Vec<StepLeftRight> {
-        const EDGE_SKIP: u8 = 2;
-
         let steps = self.limits().num_timing_steps;
 
-        // If the device reports too few steps, don't try anything.
-        let start = 1u8.saturating_add(EDGE_SKIP);
-        let end = steps.saturating_sub(EDGE_SKIP);
-        if end < start {
-            return vec![];
-        }
+        // Full sweep: 1..=steps (no edge skip)
+        let base = 1u8..=steps;
 
-        let base = start..=end;
         let right = base.clone().map(|pt| StepLeftRight {
             direction: Some(LeftRight::Right),
             steps: Steps::from(pt),
@@ -1836,7 +1829,7 @@ impl LaneMargin {
                     direction: Some(LeftRight::Left),
                     steps: Steps::from(pt),
                 })
-                .chain(right)
+            .chain(right)
                 .collect()
         } else {
             right.collect()
