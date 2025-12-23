@@ -2644,28 +2644,30 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
         }
     } else {
         // Parallel scan (default)
-        let mut handles = Vec::new();
+        let mut failed = false;
+
+        let mut bridge_devices = Vec::new();
+        let mut child_devices = Vec::new();
 
         for b in bridges.into_iter() {
+            // bridge (downstream)
+             bridge_devices.push(b.bridge);
             // children (upstream)
             for c in b.children.into_iter() {
-                let args_ = args.clone();
-                let dir_ = dir.clone();
-                handles.push(std::thread::spawn(move || {
-                    margin_one(&args_, &dir_, c, Port::Upstream)
-                }));
+                child_devices.push(c);
             }
+        }
 
-            // bridge (downstream)
+        let mut handles = Vec::new();
+        for b in bridge_devices {
             let args_ = args.clone();
             let dir_ = dir.clone();
             handles.push(std::thread::spawn(move || {
-                margin_one(&args_, &dir_, b.bridge, Port::Downstream)
+                margin_one(&args_, &dir_, b, Port::Downstream)
             }));
         }
 
-        // Collect results; if any failed, return error (and skip zipping)
-        let mut failed = false;
+        // Collect results.
         for h in handles {
             match h.join() {
                 Ok(res) => {
@@ -2680,6 +2682,33 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
                 }
             }
         }
+
+        let mut handles = Vec::new();
+        for c in child_devices {
+            let args_ = args.clone();
+            let dir_ = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                margin_one(&args_, &dir_, c, Port::Upstream)
+            }));
+        }
+
+        // Collect results.
+        for h in handles {
+            match h.join() {
+                Ok(res) => {
+                    if let Err(e) = res {
+                        eprintln!("lmar: margining a port failed: {e}");
+                        failed = true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("lmar: margin thread panicked: {e:?}");
+                    failed = true;
+                }
+            }
+        }
+
+        // If any failed, return error (and skip zipping)
         if failed {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
