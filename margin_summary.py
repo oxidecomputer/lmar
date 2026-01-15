@@ -22,6 +22,8 @@ Output naming:
     At board root: ..._plain.txt (dedup as plain_2, plain_3)
 """
 
+__version__ = "0.4.0"
+
 from tabulate import tabulate
 from argparse import ArgumentParser
 import os
@@ -71,10 +73,17 @@ def compute_margin(results: Dict[str, np.ndarray], key: str) -> float:
     """
     Eye diagram margin calculator:
     - Finds the contiguous PASS run centered around 0 on the independent axis.
-    - Calculates margin as 2 × min(left_edge, right_edge) from center.
-    - For time: 2 × min(abs(left), abs(right)) in %UI
-    - For voltage: 2 × min(abs(top), abs(bottom)) in V
-    - This represents the symmetric eye opening around center.
+    - Calculates margin as the full width/height of the PASS region.
+    - For time (width): abs(independent_axis[end_idx] - independent_axis[start_idx]) in %UI
+    - For voltage (height): abs(independent_axis[end_idx] - independent_axis[start_idx]) in V
+    - Uses abs() to handle both increasing and decreasing sweeps.
+
+    Args:
+        results: Dict containing 'passed' (bool array) and key ('time' or 'voltage')
+        key: "time" for width calculation, "voltage" for height calculation
+
+    Returns:
+        Eye margin as the distance from start to end of the PASS region
     """
     passed = np.asarray(results["passed"], dtype=bool)
     independent_axis = np.asarray(results[key])
@@ -123,18 +132,13 @@ def compute_margin(results: Dict[str, np.ndarray], key: str) -> float:
 
     start_idx, end_idx = selected_run
 
-    # If all points pass, return the full range
-    if n_passes == n_points:
-        return float(np.ptp(independent_axis))
+    # Calculate eye margin as the full span of the PASS region
+    # For time: width = right_edge - left_edge
+    # For voltage: height = top_edge - bottom_edge
+    # Use abs() to handle both increasing and decreasing sweeps
+    margin = abs(independent_axis[end_idx] - independent_axis[start_idx])
 
-    # Calculate eye margin as 2 × min(left_edge, right_edge) from center
-    # Left edge: distance from center to start of pass region
-    # Right edge: distance from center to end of pass region
-    left_edge = abs(independent_axis[start_idx] - independent_axis[center_index])
-    right_edge = abs(independent_axis[end_idx] - independent_axis[center_index])
-
-    # Return 2× the minimum edge (symmetric eye opening)
-    return 2.0 * float(min(left_edge, right_edge))
+    return float(margin)
 
 
 def load_results(file: str, pass_err_cnt: Optional[int] = None) -> Dict[str, object]:
@@ -194,13 +198,15 @@ def load_results(file: str, pass_err_cnt: Optional[int] = None) -> Dict[str, obj
     is_time = results[:, time] != 0
     is_voltage = np.logical_not(is_time)
 
-    # Determine PASS status: either from count threshold or original PASS column
+    # Determine PASS status: either from count threshold AND PASS column, or PASS column only
     if pass_err_cnt is not None:
-        # Recalculate PASS based on error count threshold: PASS if count <= pass_err_cnt
-        time_passed = results[is_time, count] <= pass_err_cnt
-        voltage_passed = results[is_voltage, count] <= pass_err_cnt
+        # Require BOTH: PASS column == 1 AND error count <= pass_err_cnt
+        time_passed = np.logical_and(results[is_time, passed_col].astype(bool),
+                                      results[is_time, count] <= pass_err_cnt)
+        voltage_passed = np.logical_and(results[is_voltage, passed_col].astype(bool),
+                                         results[is_voltage, count] <= pass_err_cnt)
     else:
-        # Use original PASS column from the file
+        # Use original PASS column from the file only
         time_passed = results[is_time, passed_col].astype(bool)
         voltage_passed = results[is_voltage, passed_col].astype(bool)
 
@@ -947,12 +953,17 @@ def main(argv: List[str]) -> None:
                      "Use --scan-root with either a top-level dir containing board dirs, "
                      "or a single board dir (e.g., BRM13250002)."))
     parser.add_argument(
+        "-v", "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    parser.add_argument(
         "-c", "--pass-count-required", type=int, default=0,
         help="Treat a row as PASS only if Pass==1 and Count==THIS (default: 0).",
     )
     parser.add_argument(
-        "--pass-err-cnt", type=lambda x: None if x.lower() == 'none' else int(x), default=12,
-        help="Maximum error count to consider a point as PASS. Points with count <= this value are PASS. Default is 12 (BER9 @ 99.99%% Confidence). Use 'None' to use the PASS column from the data file instead.",
+        "--pass-err-cnt", type=lambda x: None if x.lower() == 'none' else int(x), default=3,
+        help="Maximum error count threshold (default: 3). "
+             "Points pass if PASS column==1 AND count <= this value. "
+             "Use 'None' to use only the PASS column from the data file.",
     )
     parser.add_argument("--scan-root", default=None,
                         help="Scan a top directory containing board directories, "
