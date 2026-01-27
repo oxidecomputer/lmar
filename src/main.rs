@@ -26,6 +26,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
@@ -2927,6 +2928,10 @@ fn run_margin(
         println!("lmar: margin duration {:?}", duration);
     }
 
+    if lanes.is_empty() {
+        return Ok(());
+    }
+
     // Each lane will be margined in a thread, and will send updates to the main
     // thread for (1) writing to a file and (2) printing progress.
     let (tx, rx) = mpsc::channel();
@@ -2942,7 +2947,13 @@ fn run_margin(
     // Keep track of the state for each lane's margining protocol.
     let mut state = BTreeMap::new();
     let mut printed_caps = false;
-    let mut margining_limits = None;
+    let mut margining_limits: Option<MarginingLimits> = None;
+
+    // Per-port lane-serialization lock.  If MIndErrorSampler == 0 and
+    // more than one lane is requested, we create this and share it
+    // across all lane threads, so only one lane margins at a time.
+    let mut lane_lock: Option<Arc<Mutex<()>>> = None;
+
     for lane in lanes.iter().copied() {
         let device_ = device.try_clone()?;
         let tx_ = tx.clone();
@@ -2951,26 +2962,40 @@ fn run_margin(
         let margin = LaneMargin::new(device_, receiver, lane, args.verbose)
             .context("Could not initialize lane margining")?;
 
+        let limits_ref = margin.limits();
+        if margining_limits.is_none() {
+            margining_limits = Some(*limits_ref);
+        }
+
         // All margining threads will send us this report of
         // capabilities. Let's only print one of them.
-        let limits = margin.limits();
-        if !printed_caps && (args.verbose >= verbosity::CAPABILITIES || args.report_only)
+        let capabilities = margin.capabilities();
+        if !printed_caps
+            && (args.verbose >= verbosity::CAPABILITIES || args.report_only)
         {
-            let capabilities = margin.capabilities();
             println!("lmar: {capabilities:#?}");
-            println!("lmar: {limits:#?}");
-            // --- begin: minimal spec-parallelism notice (warn only) ---
+            println!("lmar: {limits_ref:#?}");
+
+            // --- begin: spec-based lane parallelism note ---
             if !capabilities.independent_error_sampler && lanes.len() > 1 {
                 eprintln!(
-                    "lmar: NOTE: MIndErrorSampler=0 -> spec allows at most one receiver at a time; requested {} lanes",
+                    "lmar: NOTE: MIndErrorSampler=0 -> spec allows at most one receiver at a time; \
+                     {} lanes requested; lanes will be margined **serially** on this port.",
                     lanes.len()
                 );
             }
-            // If you later surface Report(MaxLanes), compare lanes.len() to that value here too.
-            // --- end: minimal spec-parallelism notice ---
+            // --- end: spec-based lane parallelism note ---
+
             printed_caps = true;
         }
-        margining_limits.replace(limits.clone());
+
+        // Decide if we need lane serialization (one lane at a time).
+        if lane_lock.is_none()
+            && !capabilities.independent_error_sampler
+            && lanes.len() > 1
+        {
+            lane_lock = Some(Arc::new(Mutex::new(())));
+        }
 
         // If we're just reporting the capabilities and limits of the device, we
         // do not need to do anything else at all. We've printed them, and
@@ -2984,15 +3009,32 @@ fn run_margin(
         let error_count = args.error_count;
         let timing = args.timing;
         let voltage = args.voltage;
+        let lane_lock_clone = lane_lock.clone();
 
         let thr;
         if args.four_point {
             thr = thread::spawn(move || {
-                four_point(margin, duration, error_count, timing, voltage, tx_)
+                four_point(
+                    margin,
+                    duration,
+                    error_count,
+                    timing,
+                    voltage,
+                    lane_lock_clone,
+                    tx_,
+                )
             });
         } else {
             thr = thread::spawn(move || {
-                margin_lane(margin, duration, error_count, timing, voltage, tx_)
+                margin_lane(
+                    margin,
+                    duration,
+                    error_count,
+                    timing,
+                    voltage,
+                    lane_lock_clone,
+                    tx_,
+                )
             });
         }
 
@@ -3004,8 +3046,10 @@ fn run_margin(
         // necessary, but may help improve throughput a bit.
         if args.four_point {
             thread::sleep(Duration::from_secs(1 + lanes.len() as u64));
-            margining_limits.unwrap().set_timing_steps(2);
-            margining_limits.unwrap().set_voltage_steps(2);
+            if let Some(ref mut lim) = margining_limits {
+                lim.set_timing_steps(2);
+                lim.set_voltage_steps(2);
+            }
         } else {
             thread::sleep(duration / lanes.len() as u32);
         }
@@ -3013,8 +3057,12 @@ fn run_margin(
         // Set up the progress bars for this lane, if the verbosity level
         // requires it.
         let bars = if args.verbose == verbosity::PROGRESS_SUMMARY {
-            let bars =
-                ProgressBars::new(&lane, margining_limits.as_ref().unwrap());
+            let bars = ProgressBars::new(
+                &lane,
+                margining_limits
+                    .as_ref()
+                    .expect("Limits should be reported before margining starts"),
+            );
             let mp = progress.as_ref().expect("No progress bars!");
             mp.add(bars.time.clone());
             if let Some(vb) = bars.voltage.as_ref() {
@@ -3026,7 +3074,15 @@ fn run_margin(
         };
 
         // Store the state for this lane's margin worker.
-        state.insert(lane, MarginState { thr, file, n_points: (0, 0), bars });
+        state.insert(
+            lane,
+            MarginState {
+                thr,
+                file,
+                n_points: (0, 0),
+                bars,
+            },
+        );
     }
 
     // Unhide the progress bars, and tick them all manually so that they draw to
@@ -3049,8 +3105,9 @@ fn run_margin(
     // per-thread senders are closed.
     drop(tx);
     while let Ok(update) = rx.recv() {
-        let st =
-            state.get_mut(&update.lane).expect("No margining state for lane");
+        let st = state
+            .get_mut(&update.lane)
+            .expect("No margining state for lane");
         let limits = margining_limits
             .as_ref()
             .expect("Limits should be reported before margining starts");
@@ -3065,22 +3122,20 @@ fn run_margin(
                 st.n_points.1 += 1;
                 (
                     st.n_points.1,
-                    limits.num_voltage_steps.expect(
-                        "Received margin update for voltage for a \
-                    device that doesn't appear to support \
-                    voltage margining",
-                    ) * 2,
+                    limits
+                        .num_voltage_steps
+                        .expect(
+                            "Received margin update for voltage for a \
+                             device that doesn't appear to support \
+                             voltage margining",
+                        ) * 2,
                 )
             };
-        // Write the result to the output file.
-          //let (pass, count) = match update.result {
-          //    MarginResult::Success(count) => (1, u8::from(count)),
-          //    MarginResult::Failed(count) => (0, u8::from(count)),
-          //};
+
         let (pass, count_str) = match update.result {
             MarginResult::Success(count) => (1, format!("{}", u8::from(count))),
-            MarginResult::Failed(count)  => (0, format!("{}", u8::from(count))),
-            MarginResult::Timeout        => (0, "--".to_string()),
+            MarginResult::Failed(count) => (0, format!("{}", u8::from(count))),
+            MarginResult::Timeout => (0, "--".to_string()),
         };
 
         writeln!(
@@ -3096,7 +3151,9 @@ fn run_margin(
 
         // Print the progress to the screen, if needed.
         if args.verbose > verbosity::PROGRESS_SUMMARY {
-            println!("lmar: margined point {n_points} / {n_total_points}: {update:?}");
+            println!(
+                "lmar: margined point {n_points} / {n_total_points}: {update:?}"
+            );
         } else if args.verbose == verbosity::PROGRESS_SUMMARY {
             let st = state.get_mut(&update.lane).unwrap();
             let bars = st.bars.as_ref().expect("No progress bars!");
@@ -3105,8 +3162,8 @@ fn run_margin(
             } else {
                 let voltage_bar = bars.voltage.as_ref().expect(
                     "Received voltage update for a \
-                        device that doesn't appear to \
-                        support voltage margining",
+                     device that doesn't appear to \
+                     support voltage margining",
                 );
                 voltage_bar.inc(1);
             }
@@ -3209,8 +3266,18 @@ fn margin_lane(
     error_count: Option<u8>,
     timing: bool,
     voltage: bool,
+    lane_lock: Option<Arc<Mutex<()>>>,
     tx: mpsc::Sender<MarginUpdate>,
 ) -> anyhow::Result<()> {
+    // If MIndErrorSampler=0 for this port and multiple lanes are requested,
+    // run one lane at a time by holding this lock for the duration of the
+    // timing/voltage loops.
+    let _lane_guard = if let Some(ref lock) = lane_lock {
+        Some(lock.lock().unwrap())
+    } else {
+        None
+    };
+
     let lane = margin.lane();
     let capabilities = margin.capabilities();
     let limits = margin.limits();
@@ -3402,8 +3469,15 @@ fn four_point(
     error_count: Option<u8>,
     timing: bool,
     voltage: bool,
+    lane_lock: Option<Arc<Mutex<()>>>,
     tx: mpsc::Sender<MarginUpdate>,
 ) -> anyhow::Result<()> {
+    let _lane_guard = if let Some(ref lock) = lane_lock {
+        Some(lock.lock().unwrap())
+    } else {
+        None
+    };
+
     let lane = margin.lane();
     let capabilities = margin.capabilities();
     let limits = margin.limits();
