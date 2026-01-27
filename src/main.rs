@@ -1263,7 +1263,27 @@ struct LaneMarginInner {
     verbosity: u64,
 }
 
+// --- LMR helpers ----------
+fn link_rate_ok(device: &PcieDevice) -> Result<bool, Error> {
+    let s = device.link_status()?.speed.0;
+    // Accept Gen4 or Gen5 (tight tolerance to avoid float noise)
+    Ok((s - 32.0).abs() < 0.1 || (s - 16.0).abs() < 0.1)
+}
+
+// Place near other small helpers (e.g., below `link_rate_ok`)
+fn mind_error_sampler_for(node: &PcieNode, port: Port) -> Option<bool> {
+    let dev = node.device.try_clone().ok()?;
+    let lane0 = Lane::new(0).ok()?;
+    let rx = match port {
+        Port::Upstream => Receiver::upstream(),
+        Port::Downstream => Receiver::downstream(),
+    };
+    let lm = LaneMargin::new(dev, rx, lane0, 0).ok()?;
+    Some(lm.capabilities().independent_error_sampler)
+}
+
 impl LaneMarginInner {
+
     fn report(&self, request: ReportRequest) -> Result<ReportResponse, Error> {
         let cmd = MarginCommand::Report(request);
         self.write_command(cmd)?;
@@ -1351,28 +1371,66 @@ impl LaneMarginInner {
         // increased these from 10 -> 100, 250 to see if RC port failure is fixed
         const WAIT_INTERVAL: Duration = Duration::from_micros(100);
         const MAX_WAIT_TIME: Duration = Duration::from_millis(250);
+
         let now = Instant::now();
+
+        // UM tracking (added)
+        let mut saw_um_nonzero = false;
+        let mut last_raw: Option<u16> = None;
+
+        // Keep the original structure: track the *last* read_command_response()
+        // result so we can print it in the existing timeout error message.
         let response = loop {
-            // while now.elapsed() < MAX_WAIT_TIME {
             sleep(WAIT_INTERVAL);
 
             // If we find the wrong command, we actually continue up to the
             // maximum wait time.
             let response = self.read_command_response(cmd);
-            if let Ok(response) = response {
-                if self.verbosity >= verbosity::COMMAND_DETAIL {
-                    println!(
-                        "<- {response:?}, Margin type: {:#03b}, \
+
+            match response {
+                Ok(response) => {
+                    if self.verbosity >= verbosity::COMMAND_DETAIL {
+                        println!(
+                            "<- {response:?}, Margin type: {:#03b}, \
                         Receiver: {:#03b}, Payload: {:#08b}",
-                        response.margin_type(),
-                        u8::from(self.receiver),
-                        response.payload(),
-                    );
-                } else if self.verbosity >= verbosity::COMMANDS {
-                    println!("<- {response:?}");
+                            response.margin_type(),
+                            u8::from(self.receiver),
+                            response.payload(),
+                        );
+                    } else if self.verbosity >= verbosity::COMMANDS {
+                        println!("<- {response:?}");
+                    }
+                    if cmd.expects_response(response) {
+                        return Ok(response);
+                    }
                 }
-                if cmd.expects_response(response) {
-                    return Ok(response);
+                Err(Error::Margin(ref s)) => {
+                    // Added: treat UM!=0 as "not a valid status sample yet"
+                    // so we keep polling until MAX_WAIT_TIME.
+                    //
+                    // We intentionally key off a predictable prefix that
+                    // read_command_response() emits.
+                    const UM_PREFIX: &str = "Status UsageModel!=0";
+
+                    if s.starts_with(UM_PREFIX) {
+                        saw_um_nonzero = true;
+
+                        // Best-effort parse of "... raw=0x1234" to capture last_raw.
+                        if let Some(idx) = s.find("raw=0x") {
+                            let hex = &s[idx + "raw=0x".len()..];
+                            let hex = hex
+                                .chars()
+                                .take_while(|c| c.is_ascii_hexdigit())
+                                .collect::<String>();
+                            if let Ok(v) = u16::from_str_radix(&hex, 16) {
+                                last_raw = Some(v);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Other errors: keep original behavior (ignore and keep polling
+                    // until timeout; final error includes `response` as before).
                 }
             }
 
@@ -1381,14 +1439,48 @@ impl LaneMarginInner {
             }
             break response;
         };
+
+        // Preserve original timeout message, but append UM diagnostics.
         Err(Error::Margin(format!(
             concat!(
                 "margining failed, did not find expected response ",
                 "for command {:?} within time limit of {:?}: ",
                 "instead found {:?}",
             ),
-            cmd, MAX_WAIT_TIME, response
+            cmd,
+            MAX_WAIT_TIME,
+            response
+        ) + &format!(
+            " (saw_um_nonzero={}, last_raw={})",
+            saw_um_nonzero,
+            match last_raw {
+                Some(w) => format!("{w:#06x}"),
+                None => "None".to_string(),
+            }
         )))
+    }
+
+    fn read_command_response(
+        &self,
+        cmd: MarginCommand,
+    ) -> Result<MarginResponse, Error> {
+        let word: u16 = read_configuration_space(
+            &self.device.file,
+            &self.device.bdf,
+            self.sts_offset,
+        )?;
+
+        // UM is bit 6 of the status/control word per your earlier interpretation.
+        // Treat UM!=0 as "not a valid status sample yet".
+        let usage_model = ((word >> 6) & 0x1) as u8;
+        if usage_model != 0 {
+            return Err(Error::Margin(format!(
+                "Status UsageModel!=0 (um={}, raw={:#06x})",
+                usage_model, word
+            )));
+        }
+
+        MarginResponse::decode_for_cmd(cmd, word)
     }
 
     fn write_command(&self, cmd: MarginCommand) -> Result<(), Error> {
@@ -1399,18 +1491,6 @@ impl LaneMarginInner {
             self.cmd_offset,
             word,
         )
-    }
-
-    fn read_command_response(
-        &self,
-        cmd: MarginCommand,
-    ) -> Result<MarginResponse, Error> {
-        let word = read_configuration_space(
-            &self.device.file,
-            &self.device.bdf,
-            self.sts_offset,
-        )?;
-        MarginResponse::decode_for_cmd(cmd, word)
     }
 
     fn gather_limits(
@@ -1585,8 +1665,8 @@ impl LaneMarginInner {
         // Interval between checks when execution status is "setup"
         const INTERVAL: Duration = Duration::from_millis(1);
 
-        // Total duration before setup must complete
-        const TOTAL_DURATION: Duration = Duration::from_millis(2000);
+        // Total duration before setup must complete  
+        const TOTAL_DURATION: Duration = Duration::from_millis(400);
 
         // counters for NaN error info
         let mut setup_polls: u32 = 0;
@@ -2431,6 +2511,7 @@ impl MarginPoint {
 pub enum MarginResult {
     Success(ErrorCount),
     Failed(ErrorCount),
+    Timeout,  // no valid response (e.g. UM stuck != 0 until timeout)
 }
 
 fn write_file_header(
@@ -2658,6 +2739,28 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
             }
         }
 
+        // ---- PRE-PASS: report MIndErrorSampler per target to confirm capability of parallel margin----
+        let mut any_mind0 = false;
+        for b in &bridge_devices {
+            if let Some(mind) = mind_error_sampler_for(b, Port::Downstream) {
+                println!("lmar: [{}] DS MIndErrorSampler={}", b.device.bdf, if mind {1} else {0});
+                if !mind { any_mind0 = true; }
+            }
+        }
+        for c in &child_devices {
+            if let Some(mind) = mind_error_sampler_for(c, Port::Upstream) {
+                println!("lmar: [{}] US MIndErrorSampler={}", c.device.bdf, if mind {1} else {0});
+                if !mind { any_mind0 = true; }
+            }
+        }
+        if any_mind0 {
+            eprintln!("lmar: WARNING: One or more Receivers report MIndErrorSampler=0b; "
+                "spec allows at most one such Receiver to be margined at a time. "
+                "Proceeding in parallel per current tool behavior.");
+        }
+        // ---- END PRE-PASS ----
+
+
         let mut handles = Vec::new();
         for b in bridge_devices {
             let args_ = args.clone();
@@ -2851,12 +2954,20 @@ fn run_margin(
         // All margining threads will send us this report of
         // capabilities. Let's only print one of them.
         let limits = margin.limits();
-        if !printed_caps
-            && (args.verbose >= verbosity::CAPABILITIES || args.report_only)
+        if !printed_caps && (args.verbose >= verbosity::CAPABILITIES || args.report_only)
         {
             let capabilities = margin.capabilities();
             println!("lmar: {capabilities:#?}");
             println!("lmar: {limits:#?}");
+            // --- begin: minimal spec-parallelism notice (warn only) ---
+            if !capabilities.independent_error_sampler && lanes.len() > 1 {
+                eprintln!(
+                    "lmar: NOTE: MIndErrorSampler=0 -> spec allows at most one receiver at a time; requested {} lanes",
+                    lanes.len()
+                );
+            }
+            // If you later surface Report(MaxLanes), compare lanes.len() to that value here too.
+            // --- end: minimal spec-parallelism notice ---
             printed_caps = true;
         }
         margining_limits.replace(limits.clone());
@@ -2961,19 +3072,24 @@ fn run_margin(
                     ) * 2,
                 )
             };
-
         // Write the result to the output file.
-        let (pass, count) = match update.result {
-            MarginResult::Success(count) => (1, u8::from(count)),
-            MarginResult::Failed(count) => (0, u8::from(count)),
+          //let (pass, count) = match update.result {
+          //    MarginResult::Success(count) => (1, u8::from(count)),
+          //    MarginResult::Failed(count) => (0, u8::from(count)),
+          //};
+        let (pass, count_str) = match update.result {
+            MarginResult::Success(count) => (1, format!("{}", u8::from(count))),
+            MarginResult::Failed(count)  => (0, format!("{}", u8::from(count))),
+            MarginResult::Timeout        => (0, "--".to_string()),
         };
+
         writeln!(
             st.file,
             "{:0.3}\t{:0.3}\t{:0.9}\t{}\t{}",
             update.point.time(),
             update.point.voltage(),
             update.duration.as_secs_f64(),
-            count,
+            count_str,
             pass,
         )
         .unwrap();
@@ -3134,9 +3250,56 @@ fn margin_lane(
             let point = MarginPoint::Time(
                 sign * timing_resolution * f64::from(step.steps.0),
             );
-            let (margin_duration, result) = margin
-                .margin_at_left_right(step, duration)
-                .context(format!("Failed to margin point: {step:?}"))?;
+
+            // --- rate-change guards (timing) ---
+            if !link_rate_ok(&margin.inner.device)? {
+                margin.no_command()?;
+                return Err(anyhow::anyhow!("Data Rate changed before timing step"));
+            }
+
+            let res = margin.margin_at_left_right(step, duration);
+
+            let (margin_duration, result) = match res {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_um_timeout =
+                        msg.contains("margining failed, did not find expected response")
+                        && msg.contains("saw_um_nonzero=true");
+
+                    if is_um_timeout {
+                        eprintln!(
+                            "lmar: lane {} timing step {:?} timed out (UM!=0): {msg}",
+                            lane, step
+                        );
+
+                        // Best-effort cleanup
+                        let _ = margin.go_to_normal_settings();
+                        let _ = margin.no_command();
+                        let _ = margin.clear_error_log();
+                        let _ = margin.no_command();
+
+                        // Emit a timeout result for this point and move on
+                        tx.send(MarginUpdate {
+                            lane,
+                            point,
+                            duration: Duration::from_secs(0),
+                            result: MarginResult::Timeout,
+                        })?;
+                        continue;
+                    } else {
+                        // Non-UM error: keep old behavior (abort lane)
+                        return Err(e.into());
+                    }
+                }
+            };
+
+            // --- rate-change guards (timing) ---
+            if !link_rate_ok(&margin.inner.device)? {
+                let _ = margin.no_command();
+                return Err(anyhow::anyhow!("Data Rate changed during timing step"));
+            }            
+
             tx.send(MarginUpdate {
                 lane,
                 point,
@@ -3144,6 +3307,11 @@ fn margin_lane(
                 result,
             })?;
         }
+        // Spec EoD for timing direction
+        margin.go_to_normal_settings()?;
+        margin.no_command()?;
+        margin.clear_error_log()?;
+        margin.no_command()?;
     }
 
     // Iterate over the voltage steps, if supported.
@@ -3164,9 +3332,55 @@ fn margin_lane(
             let point = MarginPoint::Voltage(
                 sign * voltage_resolution * f64::from(step.steps.0),
             );
-            let (margin_duration, result) = margin
-                .margin_at_up_down(step, duration)
-                .context(format!("Failed to margin point: {step:?}"))?;
+            // --- begin: rate-change guards (voltage) ---
+            if !link_rate_ok(&margin.inner.device)? {
+                margin.no_command()?;
+                return Err(anyhow::anyhow!("Data Rate changed before voltage step"));
+            }
+
+            let res = margin.margin_at_up_down(step, duration);
+
+            let (margin_duration, result) = match res {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_um_timeout =
+                        msg.contains("margining failed, did not find expected response")
+                        && msg.contains("saw_um_nonzero=true");
+
+                    if is_um_timeout {
+                        eprintln!(
+                            "lmar: lane {} voltage step {:?} timed out (UM!=0): {msg}",
+                            lane, step
+                        );
+
+                        // Best-effort cleanup
+                        let _ = margin.go_to_normal_settings();
+                        let _ = margin.no_command();
+                        let _ = margin.clear_error_log();
+                        let _ = margin.no_command();
+
+                        tx.send(MarginUpdate {
+                            lane,
+                            point,
+                            duration: Duration::from_secs(0),
+                            result: MarginResult::Timeout,
+                        })?;
+                        continue;
+                    } else {
+                        // Non-UM error: abort lane
+                        return Err(e.into());
+                    }
+                }
+            };
+
+            // --- begin: rate-change guards (voltage) ---
+            if !link_rate_ok(&margin.inner.device)? {
+                let _ = margin.no_command();
+                return Err(anyhow::anyhow!("Data Rate changed during voltage step"));
+            }
+
+
             tx.send(MarginUpdate {
                 lane,
                 point,
@@ -3175,7 +3389,10 @@ fn margin_lane(
             })?;
         }
     }
-
+    margin.go_to_normal_settings()?;
+    margin.no_command()?;
+    margin.clear_error_log()?;
+    margin.no_command()?;
     Ok(())
 }
 
