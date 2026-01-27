@@ -899,7 +899,7 @@ pub struct ErrorCount(u8);
 
 impl From<u8> for ErrorCount {
     fn from(word: u8) -> Self {
-        Self(word & 0b11111)
+        Self(word & 0b111111)
     }
 }
 
@@ -935,7 +935,7 @@ impl From<u8> for StepLeftRight {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LeftRight {
     Left,
     Right,
@@ -986,7 +986,7 @@ impl From<u8> for StepUpDown {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UpDown {
     Up,
     Down,
@@ -1884,13 +1884,12 @@ impl LaneMargin {
         });
 
         if self.capabilities().independent_left_right_sampling {
-            base.rev()
-                .map(|pt| StepLeftRight {
-                    direction: Some(LeftRight::Left),
-                    steps: Steps::from(pt),
-                })
-                .chain(right)
-                .collect()
+            base.map(|pt| StepLeftRight {
+                direction: Some(LeftRight::Left),
+                steps: Steps::from(pt),
+            })
+            .chain(right)
+            .collect()
         } else {
             right.collect()
         }
@@ -1915,13 +1914,12 @@ impl LaneMargin {
                 });
 
                 if self.capabilities().independent_up_down_voltage {
-                    base.rev()
-                        .map(|pt| StepUpDown {
-                            direction: Some(UpDown::Down),
-                            steps: Steps::from(pt),
-                        })
-                        .chain(up)
-                        .collect()
+                    base.map(|pt| StepUpDown {
+                        direction: Some(UpDown::Down),
+                        steps: Steps::from(pt),
+                    })
+                    .chain(up)
+                    .collect()
                 } else {
                     up.collect()
                 }
@@ -2991,7 +2989,16 @@ fn run_margin(
         };
 
         // Store the state for this lane's margin worker.
-        state.insert(lane, MarginState { thr, file, n_points: (0, 0), bars });
+        state.insert(
+            lane,
+            MarginState {
+                thr,
+                file,
+                n_points: (0, 0),
+                bars,
+                updates: Vec::new(),
+            },
+        );
     }
 
     // Unhide the progress bars, and tick them all manually so that they draw to
@@ -3038,21 +3045,8 @@ fn run_margin(
                 )
             };
 
-        // Write the result to the output file.
-        let (pass, count) = match update.result {
-            MarginResult::Success(count) => (1, u8::from(count)),
-            MarginResult::Failed(count) => (0, u8::from(count)),
-        };
-        writeln!(
-            st.file,
-            "{:0.3}\t{:0.3}\t{:0.9}\t{}\t{}",
-            update.point.time(),
-            update.point.voltage(),
-            update.duration.as_secs_f64(),
-            count,
-            pass,
-        )
-        .unwrap();
+        // Accumulate the update for later sorting and writing.
+        st.updates.push(update);
 
         // Print the progress to the screen, if needed.
         if args.verbose > verbosity::PROGRESS_SUMMARY {
@@ -3085,6 +3079,46 @@ fn run_margin(
             }
         }
     }
+
+    // Sort accumulated updates and write them to files.
+    for st in state.values_mut() {
+        // Sort so that time records (voltage=0) come first sorted by time,
+        // then voltage records (time=0) sorted by voltage.
+        st.updates.sort_by(|a, b| {
+            let a_is_voltage = a.point.voltage() != 0.0;
+            let b_is_voltage = b.point.voltage() != 0.0;
+
+            a_is_voltage.cmp(&b_is_voltage).then_with(|| {
+                if a_is_voltage {
+                    a.point
+                        .voltage()
+                        .partial_cmp(&b.point.voltage())
+                        .unwrap()
+                } else {
+                    a.point.time().partial_cmp(&b.point.time()).unwrap()
+                }
+            })
+        });
+
+        // Write all sorted results to the output file.
+        for update in &st.updates {
+            let (pass, count) = match update.result {
+                MarginResult::Success(count) => (1, u8::from(count)),
+                MarginResult::Failed(count) => (0, u8::from(count)),
+            };
+            writeln!(
+                st.file,
+                "{:0.3}\t{:0.3}\t{:0.9}\t{}\t{}",
+                update.point.time(),
+                update.point.voltage(),
+                update.duration.as_secs_f64(),
+                count,
+                pass,
+            )
+            .unwrap();
+        }
+    }
+
     // Print any error messages the threads hit.
     for (lane, state) in state.into_iter() {
         match state.thr.join() {
@@ -3112,6 +3146,8 @@ struct MarginState {
     n_points: (u8, u8),
     // The progress bars, if the summary verbosity level was chosen.
     bars: Option<ProgressBars>,
+    // Accumulated updates to be sorted and written at the end.
+    updates: Vec<MarginUpdate>,
 }
 
 // The progress bars for a single lane.
@@ -3154,7 +3190,7 @@ impl ProgressBars {
 }
 
 // An update from a thread about margining a single point.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct MarginUpdate {
     // The lane being margined.
     lane: Lane,
@@ -3187,8 +3223,8 @@ fn margin_lane(
             "does not support independent error sampler"
         };
         eprintln!(
-            "Warning: Lane {} does not support custom error count \
-             limits ({}), using device default",
+            "Warning: Lane {} does not support custom error count limits\n\
+             ({}), using device default",
             u8::from(lane),
             reason
         );
@@ -3198,15 +3234,14 @@ fn margin_lane(
     let timing_resolution = limits.timing_resolution();
     let voltage_resolution = limits.voltage_resolution();
 
-    // Iterate over the timing steps from left to right.
     if timing {
+        // Iterate over the timing steps from center to left and then
+        // center to right.
         let steps = margin.iter_left_right_steps();
-        for step in steps.into_iter() {
-            // Set up per the spec for margining a single point.
-            margin.clear_error_log()?;
-            margin.go_to_normal_settings()?;
-            margin.no_command()?;
+        let mut last_result: Option<(Option<LeftRight>, u8, MarginResult)> =
+            None;
 
+        for step in steps.into_iter() {
             // Compute the actual time as a percentage of UI that we're
             // currently margining.
             let sign = if matches!(step.direction, Some(LeftRight::Left)) {
@@ -3217,27 +3252,53 @@ fn margin_lane(
             let point = MarginPoint::Time(
                 sign * timing_resolution * f64::from(step.steps.0),
             );
-            let (margin_duration, result) = margin
-                .margin_at_left_right(step, duration)
-                .context(format!("Failed to margin point: {step:?}"))?;
+
+            // Check if we should skip this point due to earlier failure
+            // in the same direction.
+            let should_skip =
+                if let Some((last_dir, last_steps, last_res)) = last_result {
+                    matches!(last_res, MarginResult::Failed(_))
+                        && last_dir == step.direction
+                        && step.steps.0 > last_steps
+                } else {
+                    false
+                };
+
+            let (margin_duration, result) = if should_skip {
+                // Skip the actual margin and synthesize a failure.
+                (
+                    Duration::from_secs(0),
+                    MarginResult::Failed(ErrorCount::from(63)),
+                )
+            } else {
+                // Set up per the spec for margining a single point.
+                margin.clear_error_log()?;
+                margin.go_to_normal_settings()?;
+                margin.no_command()?;
+
+                margin
+                    .margin_at_left_right(step, duration)
+                    .context(format!("Failed to margin point: {step:?}"))?
+            };
+
             tx.send(MarginUpdate {
                 lane,
                 point,
                 duration: margin_duration,
                 result,
             })?;
+
+            // Update last result for early stopping logic.
+            last_result = Some((step.direction, step.steps.0, result));
         }
     }
 
     // Iterate over the voltage steps, if supported.
     if voltage && capabilities.voltage_supported {
         let steps = margin.iter_up_down_steps();
-        for step in steps.into_iter() {
-            // Set up per the spec for margining a single point.
-            margin.clear_error_log()?;
-            margin.go_to_normal_settings()?;
-            margin.no_command()?;
+        let mut last_result: Option<(Option<UpDown>, u8, MarginResult)> = None;
 
+        for step in steps.into_iter() {
             // Compute the actual voltage at which we're margining.
             let sign = if matches!(step.direction, Some(UpDown::Down)) {
                 -1.0
@@ -3247,15 +3308,44 @@ fn margin_lane(
             let point = MarginPoint::Voltage(
                 sign * voltage_resolution * f64::from(step.steps.0),
             );
-            let (margin_duration, result) = margin
-                .margin_at_up_down(step, duration)
-                .context(format!("Failed to margin point: {step:?}"))?;
+
+            // Check if we should skip this point due to earlier failure
+            // in the same direction.
+            let should_skip =
+                if let Some((last_dir, last_steps, last_res)) = last_result {
+                    matches!(last_res, MarginResult::Failed(_))
+                        && last_dir == step.direction
+                        && step.steps.0 > last_steps
+                } else {
+                    false
+                };
+
+            let (margin_duration, result) = if should_skip {
+                // Skip the actual margin and synthesize a failure.
+                (
+                    Duration::from_secs(0),
+                    MarginResult::Failed(ErrorCount::from(63)),
+                )
+            } else {
+                // Set up per the spec for margining a single point.
+                margin.clear_error_log()?;
+                margin.go_to_normal_settings()?;
+                margin.no_command()?;
+
+                margin
+                    .margin_at_up_down(step, duration)
+                    .context(format!("Failed to margin point: {step:?}"))?
+            };
+
             tx.send(MarginUpdate {
                 lane,
                 point,
                 duration: margin_duration,
                 result,
             })?;
+
+            // Update last result for early stopping logic.
+            last_result = Some((step.direction, step.steps.0, result));
         }
     }
 
