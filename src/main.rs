@@ -841,6 +841,10 @@ impl ReportCapabilities {
     pub fn is_rate_based(&self) -> bool {
         matches!(self.sample_reporting_method, SampleReportingMethod::Rate)
     }
+
+    pub fn has_independent_error_sampler(&self) -> bool {
+        self.independent_error_sampler
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2565,6 +2569,18 @@ impl OutputExt for std::process::Output {
     }
 }
 
+/// Check if a device supports independent error sampler.
+/// This determines whether the device can be margined in parallel with others.
+fn check_independent_error_sampler(
+    device: &PcieDevice,
+    receiver: Receiver,
+) -> Result<bool> {
+    // Use lane 0 to query capabilities
+    let lane = Lane(0);
+    let margin = LaneMargin::new(device.try_clone()?, receiver, lane, 0)?;
+    Ok(margin.capabilities().has_independent_error_sampler())
+}
+
 fn margin_one(
     args: &Args,
     dir: &PathBuf,
@@ -2705,24 +2721,76 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
         // Parallel scan (default)
         let mut failed = false;
 
-        let mut bridge_devices = Vec::new();
-        let mut child_devices = Vec::new();
+        // Categorise devices based on independent error sampler support.
+        // Devices with independent error sampler can be margined in parallel.
+        // Devices without must be margined serially.
+        let mut independent_devices = Vec::new();
+        let mut dependent_devices = Vec::new();
 
         for b in bridges.into_iter() {
-            // bridge (downstream)
-            bridge_devices.push(b.bridge);
-            // children (upstream)
+            if b.bridge.margin {
+                // Check bridge (downstream)
+                match check_independent_error_sampler(
+                    &b.bridge.device,
+                    Receiver::downstream(),
+                ) {
+                    Ok(true) => {
+                        independent_devices.push((b.bridge, Port::Downstream));
+                    }
+                    Ok(false) => {
+                        dependent_devices.push((b.bridge, Port::Downstream));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "lmar: failed to check capabilities for {}: {e}",
+                            b.bridge.device.bdf
+                        );
+                        failed = true;
+                    }
+                }
+            }
+
+            // Check children (upstream)
             for c in b.children.into_iter() {
-                child_devices.push(c);
+                if !c.margin {
+                    continue;
+                }
+                match check_independent_error_sampler(
+                    &c.device,
+                    Receiver::upstream(),
+                ) {
+                    Ok(true) => {
+                        independent_devices.push((c, Port::Upstream));
+                    }
+                    Ok(false) => {
+                        dependent_devices.push((c, Port::Upstream));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "lmar: failed to check capabilities for {}: {e}",
+                            c.device.bdf
+                        );
+                        failed = true;
+                    }
+                }
             }
         }
 
+        if failed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "failed to check device capabilities",
+            )
+            .into());
+        }
+
+        // Margin all independent devices in parallel.
         let mut handles = Vec::new();
-        for b in bridge_devices {
+        for (node, port) in independent_devices {
             let args_ = args.clone();
             let dir_ = dir.clone();
             handles.push(std::thread::spawn(move || {
-                margin_one(&args_, &dir_, b, Port::Downstream)
+                margin_one(&args_, &dir_, node, port)
             }));
         }
 
@@ -2742,28 +2810,11 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
             }
         }
 
-        let mut handles = Vec::new();
-        for c in child_devices {
-            let args_ = args.clone();
-            let dir_ = dir.clone();
-            handles.push(std::thread::spawn(move || {
-                margin_one(&args_, &dir_, c, Port::Upstream)
-            }));
-        }
-
-        // Collect results.
-        for h in handles {
-            match h.join() {
-                Ok(res) => {
-                    if let Err(e) = res {
-                        eprintln!("lmar: margining a port failed: {e}");
-                        failed = true;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("lmar: margin thread panicked: {e:?}");
-                    failed = true;
-                }
+        // Margin dependent devices serially (one at a time).
+        for (node, port) in dependent_devices {
+            if let Err(e) = margin_one(&args, &dir, node, port) {
+                eprintln!("lmar: margining a port failed: {e}");
+                failed = true;
             }
         }
 
@@ -2899,6 +2950,7 @@ fn run_margin(
     let mut state = BTreeMap::new();
     let mut printed_caps = false;
     let mut margining_limits = None;
+    let mut first_lane = true;
     for lane in lanes.iter().copied() {
         let device_ = device.try_clone()?;
         let tx_ = tx.clone();
@@ -2920,7 +2972,9 @@ fn run_margin(
         }
         margining_limits.replace(limits.clone());
 
-        if args.verbose >= verbosity::CAPABILITIES || args.report_only {
+        if first_lane && args.verbose >= verbosity::CAPABILITIES
+            || args.report_only
+        {
             println!(
                 "Timing: steps={} offset={} step={}%",
                 f64::from(limits.num_timing_steps),
@@ -2934,6 +2988,7 @@ fn run_margin(
                 limits.voltage_resolution()
             );
         }
+        first_lane = false;
 
         // If we're just reporting the capabilities and limits of the device, we
         // do not need to do anything else at all. We've printed them, and
@@ -3090,10 +3145,7 @@ fn run_margin(
 
             a_is_voltage.cmp(&b_is_voltage).then_with(|| {
                 if a_is_voltage {
-                    a.point
-                        .voltage()
-                        .partial_cmp(&b.point.voltage())
-                        .unwrap()
+                    a.point.voltage().partial_cmp(&b.point.voltage()).unwrap()
                 } else {
                     a.point.time().partial_cmp(&b.point.time()).unwrap()
                 }
@@ -3216,18 +3268,6 @@ fn margin_lane(
 
     if margin.supports_error_count_limit() {
         margin.set_error_count_limit(error_count).unwrap();
-    } else {
-        let reason = if capabilities.is_rate_based() {
-            "uses rate-based sampling (not count-based)"
-        } else {
-            "does not support independent error sampler"
-        };
-        eprintln!(
-            "Warning: Lane {} does not support custom error count limits\n\
-             ({}), using device default",
-            u8::from(lane),
-            reason
-        );
     }
 
     // Compute the resolution in both dimensions.
