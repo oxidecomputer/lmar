@@ -119,6 +119,7 @@ impl std::str::FromStr for LaneDescription {
 
 #[derive(Parser, Clone, Debug)]
 #[clap(author, version, about, long_about = None)]
+#[clap(max_term_width = 80)]
 /// The `lmar` program is a prototype tool to run the PCIe Lane Margining at the
 /// Receiver protocol on an attached PCIe endpoint.
 ///
@@ -187,6 +188,11 @@ struct Args {
     #[clap(short = '4', long = "four-point")]
     four_point: bool,
 
+    /// Force parallel scanning of ports that do not support an independent
+    /// error sampler when probing (-p).
+    #[clap(short = 'F', long = "force-parallel")]
+    force_parallel: bool,
+
     /// Create a zip of the output directory (single-target mode only).
     ///
     /// When probing (-p), results are always zipped. This flag only affects
@@ -194,19 +200,33 @@ struct Args {
     #[clap(short = 'z', long = "zip")]
     zip: bool,
 
-    /// Don't run Timing margining.
+    /// Don't run timing margining.
     #[clap(long = "no-timing", action = ArgAction::SetFalse)]
     timing: bool,
     /// Run timing margining [default].
     #[clap(long = "timing", overrides_with = "timing")]
     _no_timing: bool,
 
-    /// Don't run Voltage margining.
+    /// Don't run voltage margining.
     #[clap(long = "no-voltage", action = ArgAction::SetFalse)]
     voltage: bool,
     /// Run Voltage margining if supported [default].
     #[clap(long = "voltage", overrides_with = "voltage")]
     _no_voltage: bool,
+
+    /// Don't margin bridges when probing (-p).
+    #[clap(long = "no-bridges", action = ArgAction::SetFalse)]
+    bridges: bool,
+    /// Margin the bridges when probing (-p) [default].
+    #[clap(long = "bridges", overrides_with = "bridges")]
+    _no_bridges: bool,
+
+    /// Don't margin child devices when probing (-p).
+    #[clap(long = "no-children", action = ArgAction::SetFalse)]
+    children: bool,
+    /// Margin the children when probing (-p) [default].
+    #[clap(long = "children", overrides_with = "children")]
+    _no_children: bool,
 }
 
 /// Errors working with a PCIe device
@@ -2728,7 +2748,7 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
         let mut dependent_devices = Vec::new();
 
         for b in bridges.into_iter() {
-            if b.bridge.margin {
+            if args.bridges && b.bridge.margin {
                 // Check bridge (downstream)
                 match check_independent_error_sampler(
                     &b.bridge.device,
@@ -2751,6 +2771,9 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
             }
 
             // Check children (upstream)
+            if !args.children {
+                continue;
+            }
             for c in b.children.into_iter() {
                 if !c.margin {
                     continue;
@@ -2810,11 +2833,40 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
             }
         }
 
-        // Margin dependent devices serially (one at a time).
-        for (node, port) in dependent_devices {
-            if let Err(e) = margin_one(&args, &dir, node, port) {
-                eprintln!("lmar: margining a port failed: {e}");
-                failed = true;
+        if args.force_parallel {
+            // Margin dependent devices in parallel - not compliant with the
+            // specification.
+            handles = Vec::new();
+            for (node, port) in dependent_devices {
+                let args_ = args.clone();
+                let dir_ = dir.clone();
+                handles.push(std::thread::spawn(move || {
+                    margin_one(&args_, &dir_, node, port)
+                }));
+            }
+
+            // Collect results.
+            for h in handles {
+                match h.join() {
+                    Ok(res) => {
+                        if let Err(e) = res {
+                            eprintln!("lmar: margining a port failed: {e}");
+                            failed = true;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("lmar: margin thread panicked: {e:?}");
+                        failed = true;
+                    }
+                }
+            }
+        } else {
+            // Margin dependent devices serially (one at a time).
+            for (node, port) in dependent_devices {
+                if let Err(e) = margin_one(&args, &dir, node, port) {
+                    eprintln!("lmar: margining a port failed: {e}");
+                    failed = true;
+                }
             }
         }
 
@@ -2950,7 +3002,6 @@ fn run_margin(
     let mut state = BTreeMap::new();
     let mut printed_caps = false;
     let mut margining_limits = None;
-    let mut first_lane = true;
     for lane in lanes.iter().copied() {
         let device_ = device.try_clone()?;
         let tx_ = tx.clone();
@@ -2968,12 +3019,11 @@ fn run_margin(
             let capabilities = margin.capabilities();
             println!("lmar: {capabilities:#?}");
             println!("lmar: {limits:#?}");
-            printed_caps = true;
         }
         margining_limits.replace(limits.clone());
 
-        if first_lane && args.verbose >= verbosity::CAPABILITIES
-            || args.report_only
+        if !printed_caps
+            && (args.verbose >= verbosity::CAPABILITIES || args.report_only)
         {
             println!(
                 "Timing: steps={} offset={} step={}%",
@@ -2988,7 +3038,7 @@ fn run_margin(
                 limits.voltage_resolution()
             );
         }
-        first_lane = false;
+        printed_caps = true;
 
         // If we're just reporting the capabilities and limits of the device, we
         // do not need to do anything else at all. We've printed them, and
