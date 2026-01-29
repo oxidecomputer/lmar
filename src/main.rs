@@ -1513,6 +1513,20 @@ impl LaneMarginInner {
                 }
             };
 
+        let max_lanes =
+            match self.report(ReportRequest::MaxLanes)? {
+                ReportResponse::MaxLanes(lanes) => {
+                    self.no_command()?;
+                    lanes
+                }
+                other => {
+                    return Err(Error::Margin(format!(
+                    "Unexpected response requesting MaxLanes: {:?}",
+                    other
+                )));
+                }
+            };
+
         Ok(MarginingLimits {
             num_voltage_steps,
             num_timing_steps,
@@ -1520,6 +1534,7 @@ impl LaneMarginInner {
             max_voltage_offset,
             sampling_rate_voltage,
             sampling_rate_timing,
+            max_lanes,
         })
     }
 
@@ -1678,6 +1693,7 @@ pub struct MarginingLimits {
     pub max_voltage_offset: Option<u8>,
     pub sampling_rate_voltage: Option<u8>,
     pub sampling_rate_timing: u8,
+    pub max_lanes: u8,
 }
 
 impl MarginingLimits {
@@ -2855,8 +2871,8 @@ fn run_margin(
             && (args.verbose >= verbosity::CAPABILITIES || args.report_only)
         {
             let capabilities = margin.capabilities();
-            println!("lmar: {capabilities:#?}");
-            println!("lmar: {limits:#?}");
+            println!("lmar({}): {capabilities:#?}", device.bdf);
+            println!("lmar({}): {limits:#?}", device.bdf);
             printed_caps = true;
         }
         margining_limits.replace(limits.clone());
