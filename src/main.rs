@@ -2890,16 +2890,11 @@ fn run_margin(
         let timing = args.timing;
         let voltage = args.voltage;
 
-        let thr;
-        if args.four_point {
-            thr = thread::spawn(move || {
-                four_point(margin, duration, error_count, timing, voltage, tx_)
-            });
+        let result = if args.four_point {
+            four_point(margin, duration, error_count, timing, voltage, tx_)
         } else {
-            thr = thread::spawn(move || {
-                margin_lane(margin, duration, error_count, timing, voltage, tx_)
-            });
-        }
+            margin_lane(margin, duration, error_count, timing, voltage, tx_)
+        };
 
         if args.verbose >= verbosity::FILENAME {
             println!("lmar: saving lane {} to \"{}\"", lane, filename);
@@ -2931,7 +2926,7 @@ fn run_margin(
         };
 
         // Store the state for this lane's margin worker.
-        state.insert(lane, MarginState { thr, file, n_points: (0, 0), bars });
+        state.insert(lane, MarginState { result, file, n_points: (0, 0), bars });
     }
 
     // Unhide the progress bars, and tick them all manually so that they draw to
@@ -3024,13 +3019,10 @@ fn run_margin(
     }
     // Print any error messages the threads hit.
     for (lane, state) in state.into_iter() {
-        match state.thr.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                eprintln!("lmar: margining lane {lane} failed: {e:#}");
-            }
+        match state.result {
+            Ok(()) => {}
             Err(e) => {
-                eprintln!("lmar: margining lane {lane} panicked: {e:?}");
+                eprintln!("lmar: margining lane {lane} failed: {e:#}");
             }
         }
     }
@@ -3041,8 +3033,8 @@ fn run_margin(
 // The state maintained for running the margining protocol in a thread.
 #[derive(Debug)]
 struct MarginState {
-    // Handle to the thread running the protocol.
-    thr: thread::JoinHandle<anyhow::Result<()>>,
+    // result of a lane margin
+    result: anyhow::Result<()>,
     // File to which results are saved.
     file: File,
     // The number of points margined, for voltage and time.
