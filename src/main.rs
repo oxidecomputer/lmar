@@ -3304,6 +3304,11 @@ struct MarginUpdate {
     result: MarginResult,
 }
 
+// Number of consecutive failures needed to trigger early stopping.
+// Once this many consecutive failures are seen in a direction, remaining
+// points in that direction are skipped and synthesized as failures.
+const CONSECUTIVE_FAILURES_THRESHOLD: u8 = 2;
+
 fn margin_lane(
     margin: LaneMargin,
     duration: Duration,
@@ -3328,10 +3333,18 @@ fn margin_lane(
         // Iterate over the timing steps from center to left and then
         // center to right.
         let steps = margin.iter_left_right_steps();
-        let mut last_result: Option<(Option<LeftRight>, u8, MarginResult)> =
-            None;
+        let mut consecutive_failures: u8 = 0;
+        let mut current_direction: Option<LeftRight> = None;
+        let mut should_skip_remaining = false;
 
         for step in steps.into_iter() {
+            // Reset tracking when direction changes.
+            if current_direction != step.direction {
+                consecutive_failures = 0;
+                current_direction = step.direction;
+                should_skip_remaining = false;
+            }
+
             // Compute the actual time as a percentage of UI that we're
             // currently margining.
             let sign = if matches!(step.direction, Some(LeftRight::Left)) {
@@ -3343,18 +3356,7 @@ fn margin_lane(
                 sign * timing_resolution * f64::from(step.steps.0),
             );
 
-            // Check if we should skip this point due to earlier failure
-            // in the same direction.
-            let should_skip =
-                if let Some((last_dir, last_steps, last_res)) = last_result {
-                    matches!(last_res, MarginResult::Failed(_))
-                        && last_dir == step.direction
-                        && step.steps.0 > last_steps
-                } else {
-                    false
-                };
-
-            let (margin_duration, result) = if should_skip {
+            let (margin_duration, result) = if should_skip_remaining {
                 // Skip the actual margin and synthesize a failure.
                 (
                     Duration::from_secs(0),
@@ -3378,17 +3380,35 @@ fn margin_lane(
                 result,
             })?;
 
-            // Update last result for early stopping logic.
-            last_result = Some((step.direction, step.steps.0, result));
+            // Update consecutive failure tracking for early stopping.
+            if !should_skip_remaining {
+                if matches!(result, MarginResult::Failed(_)) {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD {
+                        should_skip_remaining = true;
+                    }
+                } else {
+                    consecutive_failures = 0;
+                }
+            }
         }
     }
 
     // Iterate over the voltage steps, if supported.
     if voltage && capabilities.voltage_supported {
         let steps = margin.iter_up_down_steps();
-        let mut last_result: Option<(Option<UpDown>, u8, MarginResult)> = None;
+        let mut consecutive_failures: u8 = 0;
+        let mut current_direction: Option<UpDown> = None;
+        let mut should_skip_remaining = false;
 
         for step in steps.into_iter() {
+            // Reset tracking when direction changes.
+            if current_direction != step.direction {
+                consecutive_failures = 0;
+                current_direction = step.direction;
+                should_skip_remaining = false;
+            }
+
             // Compute the actual voltage at which we're margining.
             let sign = if matches!(step.direction, Some(UpDown::Down)) {
                 -1.0
@@ -3399,18 +3419,7 @@ fn margin_lane(
                 sign * voltage_resolution * f64::from(step.steps.0),
             );
 
-            // Check if we should skip this point due to earlier failure
-            // in the same direction.
-            let should_skip =
-                if let Some((last_dir, last_steps, last_res)) = last_result {
-                    matches!(last_res, MarginResult::Failed(_))
-                        && last_dir == step.direction
-                        && step.steps.0 > last_steps
-                } else {
-                    false
-                };
-
-            let (margin_duration, result) = if should_skip {
+            let (margin_duration, result) = if should_skip_remaining {
                 // Skip the actual margin and synthesize a failure.
                 (
                     Duration::from_secs(0),
@@ -3434,8 +3443,17 @@ fn margin_lane(
                 result,
             })?;
 
-            // Update last result for early stopping logic.
-            last_result = Some((step.direction, step.steps.0, result));
+            // Update consecutive failure tracking for early stopping.
+            if !should_skip_remaining {
+                if matches!(result, MarginResult::Failed(_)) {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD {
+                        should_skip_remaining = true;
+                    }
+                } else {
+                    consecutive_failures = 0;
+                }
+            }
         }
     }
 
