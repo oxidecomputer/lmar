@@ -228,7 +228,8 @@ def group_by(rows: List[Dict[str, Any]], keys: Tuple[str, ...]) -> Dict[Tuple[An
 def gate_ports_by_limits(rows: List[Dict[str, Any]],
                          width_limit: float,
                          height_limit: float,
-                         verbose: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
+                         verbose: bool = False,
+                         skip_lane_check: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Keep a port label only if lanes {0,1,2,3} are all present AND, for each lane,
     min(Width) >= width_limit and min(Height) >= height_limit across any duplicate
@@ -249,7 +250,7 @@ def gate_ports_by_limits(rows: List[Dict[str, Any]],
         for r in items:
             lanes.setdefault(r["Lane"], []).append(r)
 
-        if set(lanes.keys()) != required_lanes:
+        if not skip_lane_check and set(lanes.keys()) != required_lanes:
             if verbose:
                 missing = required_lanes - set(lanes.keys())
                 drop_reasons.append(f"  {sn} / {port}: missing lanes {sorted(missing)}")
@@ -259,7 +260,8 @@ def gate_ports_by_limits(rows: List[Dict[str, Any]],
         failed_lane = None
         failed_width = None
         failed_height = None
-        for ln in required_lanes:
+        lanes_to_check = lanes.keys() if skip_lane_check else required_lanes
+        for ln in lanes_to_check:
             wmin = min(x["Width"] for x in lanes[ln])
             hmin = min(x["Height"] for x in lanes[ln])
             if wmin < width_limit or hmin < height_limit:
@@ -348,7 +350,7 @@ def build_output_for_files(files: List[str], args: argparse.Namespace) -> str:
             return buf.getvalue()
 
         # Port-level gating: require lanes 0..3 and per-lane mins ≥ limits
-        combined, drop_reasons = gate_ports_by_limits(combined, args.width_limit, args.height_limit, args.verbose)
+        combined, drop_reasons = gate_ports_by_limits(combined, args.width_limit, args.height_limit, args.verbose, args.no_lane_gating)
         if drop_reasons:
             print("Ports dropped during gating:")
             for reason in drop_reasons:
@@ -643,6 +645,8 @@ def main():
                     help="Max chars for name columns (default: 25).")
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="Enable verbose output showing filtering details.")
+    ap.add_argument("--no-lane-gating", action="store_true",
+                    help="Disable lane gating (don't require all 4 lanes per port).")
     ap.add_argument("-V", "--version", action="version", version="%(prog)s 2.3")
 
     args = ap.parse_args()
