@@ -193,6 +193,10 @@ struct Args {
     #[clap(short = 'F', long = "force-parallel")]
     force_parallel: bool,
 
+    /// Margin lanes serially (one at a time) instead of in parallel.
+    #[clap(long = "serial-lanes")]
+    serial_lanes: bool,
+
     /// Create a zip of the output directory (single-target mode only).
     ///
     /// When probing (-p), results are always zipped. This flag only affects
@@ -2669,7 +2673,14 @@ fn margin_one(
         Port::Downstream => Receiver::downstream(),
     };
 
-    run_margin(dir.to_str(), &node.device, lanes, receiver, args)
+    if args.serial_lanes {
+        for lane in lanes {
+            run_margin(dir.to_str(), &node.device, vec![lane], receiver, args)?;
+        }
+        Ok(())
+    } else {
+        run_margin(dir.to_str(), &node.device, lanes, receiver, args)
+    }
 }
 
 fn zip_dir(src_dir: &Path, dst_file: &Path) -> anyhow::Result<()> {
@@ -2956,7 +2967,13 @@ fn main() -> anyhow::Result<()> {
         format!("margin-{}", chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S"));
     fs::create_dir(&dirname).context("Failed to create output directory")?;
 
-    run_margin(Some(&dirname), &device, lanes, receiver, &args)?;
+    if args.serial_lanes {
+        for lane in lanes {
+            run_margin(Some(&dirname), &device, vec![lane], receiver, &args)?;
+        }
+    } else {
+        run_margin(Some(&dirname), &device, lanes, receiver, &args)?;
+    }
 
     if args.zip {
         let dir = std::path::Path::new(&dirname);
