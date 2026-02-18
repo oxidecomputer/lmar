@@ -197,6 +197,10 @@ struct Args {
     #[clap(long = "serial-lanes")]
     serial_lanes: bool,
 
+    /// Retry a margin point once on timeout or error.
+    #[clap(long = "retry-point")]
+    retry_point: bool,
+
     /// Create a zip of the output directory (single-target mode only).
     ///
     /// When probing (-p), results are always zipped. This flag only affects
@@ -1312,6 +1316,7 @@ struct LaneMarginInner {
     cmd_offset: usize,
     sts_offset: usize,
     verbosity: u64,
+    retry_point: bool,
 }
 
 impl LaneMarginInner {
@@ -1620,7 +1625,8 @@ impl LaneMarginInner {
         cmd: MarginCommand,
         duration: Duration,
     ) -> Result<(Duration, MarginResult), Error> {
-        // Retry once on setup timeout.
+        // Retry once on setup timeout, or on any error if retry_point
+        // is enabled.
         for attempt in 0..=1 {
             match self.margin_at_once(cmd, duration) {
                 Ok(v) => return Ok(v),
@@ -1628,8 +1634,10 @@ impl LaneMarginInner {
                     let msg = e.to_string();
                     let is_setup_timeout =
                         msg.contains("Failed to finish margin setup within");
+                    let should_retry =
+                        is_setup_timeout || self.retry_point;
 
-                    if !is_setup_timeout || attempt == 1 {
+                    if !should_retry || attempt == 1 {
                         return Err(e);
                     }
 
@@ -1786,6 +1794,7 @@ impl LaneMargin {
         receiver: Receiver,
         lane: Lane,
         verbosity: u64,
+        retry: bool,
     ) -> Result<Self, Error> {
         // Find the size of the capability header, limited to the width of the
         // link.
@@ -1823,6 +1832,7 @@ impl LaneMargin {
             cmd_offset,
             sts_offset,
             verbosity,
+            retry_point: retry,
         };
         let capabilities = inner.report_capabilities()?;
         inner.no_command()?;
@@ -2601,7 +2611,7 @@ fn check_independent_error_sampler(
 ) -> Result<bool> {
     // Use lane 0 to query capabilities
     let lane = Lane(0);
-    let margin = LaneMargin::new(device.try_clone()?, receiver, lane, 0)?;
+    let margin = LaneMargin::new(device.try_clone()?, receiver, lane, 0, false)?;
     Ok(margin.capabilities().has_independent_error_sampler())
 }
 
@@ -3024,7 +3034,7 @@ fn run_margin(
         let tx_ = tx.clone();
 
         // Construct object for running the margining protocol.
-        let margin = LaneMargin::new(device_, receiver, lane, args.verbose)
+        let margin = LaneMargin::new(device_, receiver, lane, args.verbose, args.retry_point)
             .context("Could not initialize lane margining")?;
 
         // All margining threads will send us this report of
