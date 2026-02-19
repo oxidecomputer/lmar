@@ -482,7 +482,10 @@ impl fmt::Display for LinkSpeed {
             LinkSpeed(8.0) => "Gen3",
             LinkSpeed(16.0) => "Gen4",
             LinkSpeed(32.0) => "Gen5",
-            _ => &format!("{:?}", self),
+            _ => {
+                write!(f, "{:?}", self)?;
+                return Ok(());
+            }
         };
         write!(f, "{}", s)
     }
@@ -973,7 +976,7 @@ impl From<u8> for StepLeftRight {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LeftRight {
     Left,
     Right,
@@ -1024,7 +1027,7 @@ impl From<u8> for StepUpDown {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UpDown {
     Up,
     Down,
@@ -3114,8 +3117,10 @@ fn run_margin(
         // necessary, but may help improve throughput a bit.
         if args.four_point {
             thread::sleep(Duration::from_secs(1 + lanes.len() as u64));
-            margining_limits.unwrap().set_timing_steps(2);
-            margining_limits.unwrap().set_voltage_steps(2);
+            if let Some(ref mut lim) = margining_limits {
+                lim.set_timing_steps(2);
+                lim.set_voltage_steps(2);
+            }
         } else {
             thread::sleep(duration / lanes.len() as u32);
         }
@@ -3363,6 +3368,62 @@ struct StepKeyUD {
 // points in that direction are skipped and synthesized as failures.
 const CONSECUTIVE_FAILURES_THRESHOLD: u8 = 2;
 
+// Fast-sweep tuning:
+// - We stop binary shrinking once the pass/fail bracket is this wide.
+//   target = clamp(N/16, min=2, max=8)
+const FAST_SWEEP_BRACKET_MIN: u8 = 2;
+const FAST_SWEEP_BRACKET_MAX: u8 = 8;
+
+fn probe_ud_into(
+    measured: &mut BTreeMap<StepKeyUD, (Duration, MarginResult)>,
+    probe_once: &dyn Fn(StepUpDown) -> anyhow::Result<(Duration, MarginResult)>,
+    probe_zero_candidate: &dyn Fn(StepUpDown) -> anyhow::Result<(Duration, MarginResult)>,
+    dir: UpDown,
+    s: u8,
+    zero_candidate: bool,
+) -> anyhow::Result<(Duration, MarginResult)> {
+    let step = StepUpDown {
+        direction: Some(dir),
+        steps: Steps::from(s),
+    };
+
+    let (d, r) = if zero_candidate {
+        probe_zero_candidate(step)?
+    } else {
+        probe_once(step)?
+    };
+
+    measured.insert(StepKeyUD { dir, step: s }, (d, r));
+    Ok((d, r))
+}
+
+fn probe_lr_into(
+    measured: &mut BTreeMap<StepKeyLR, (Duration, MarginResult)>,
+    probe_once: &dyn Fn(StepLeftRight) -> anyhow::Result<(Duration, MarginResult)>,
+    probe_zero_candidate: &dyn Fn(StepLeftRight) -> anyhow::Result<(Duration, MarginResult)>,
+    dir: LeftRight,
+    s: u8,
+    zero_candidate: bool,
+) -> anyhow::Result<(Duration, MarginResult)> {
+    let step = StepLeftRight {
+        direction: Some(dir),
+        steps: Steps::from(s),
+    };
+
+    let (d, r) = if zero_candidate {
+        probe_zero_candidate(step)?
+    } else {
+        probe_once(step)?
+    };
+
+    measured.insert(StepKeyLR { dir, step: s }, (d, r));
+    Ok((d, r))
+}
+
+// How many 0-error points we try to confirm just inside the edge.
+// NOTE: 1 is likely enough; try EDGE_ZERO_TARGET=1 to save time.
+const EDGE_ZERO_TARGET: u8 = 2;
+
 fn margin_lane(
     margin: LaneMargin,
     duration: Duration,
@@ -3400,7 +3461,7 @@ fn margin_lane(
     }
 
     // Probe a point once (includes the standard setup sequence).
-    let mut probe_left_right_once = |step: StepLeftRight| -> anyhow::Result<(Duration, MarginResult)> {
+    let probe_left_right_once = |step: StepLeftRight| -> anyhow::Result<(Duration, MarginResult)> {
         margin.clear_error_log()?;
         margin.go_to_normal_settings()?;
         margin.no_command()?;
@@ -3410,7 +3471,7 @@ fn margin_lane(
         Ok((d, r))
     };
 
-    let mut probe_up_down_once = |step: StepUpDown| -> anyhow::Result<(Duration, MarginResult)> {
+    let probe_up_down_once = |step: StepUpDown| -> anyhow::Result<(Duration, MarginResult)> {
         margin.clear_error_log()?;
         margin.go_to_normal_settings()?;
         margin.no_command()?;
@@ -3422,7 +3483,7 @@ fn margin_lane(
 
     // For "0-candidate" probes only: if pass but nonzero, re-probe once and
     // keep the better (lower) error count. Duration is summed.
-    let mut probe_left_right_zero_candidate =
+    let probe_left_right_zero_candidate =
         |step: StepLeftRight| -> anyhow::Result<(Duration, MarginResult)> {
             let (d1, r1) = probe_left_right_once(step)?;
             if !is_fail(&r1) && !is_zero(&r1) {
@@ -3436,7 +3497,7 @@ fn margin_lane(
             }
         };
 
-    let mut probe_up_down_zero_candidate =
+    let probe_up_down_zero_candidate =
         |step: StepUpDown| -> anyhow::Result<(Duration, MarginResult)> {
             let (d1, r1) = probe_up_down_once(step)?;
             if !is_fail(&r1) && !is_zero(&r1) {
@@ -3518,39 +3579,38 @@ fn margin_lane(
 
             let max_step = limits.num_timing_steps;
 
-            // Measured points stored here; we will emit everything at the end.
             let mut measured: BTreeMap<StepKeyLR, (Duration, MarginResult)> =
                 BTreeMap::new();
 
-            // Per-direction edge info: first failing step, if any.
+            // Cached probe: avoid re-probing the same (dir, step).
+            let probe_lr_cached =
+                |measured: &mut BTreeMap<StepKeyLR, (Duration, MarginResult)>,
+                dir: LeftRight,
+                s: u8,
+                zero_candidate: bool|
+                -> anyhow::Result<(Duration, MarginResult)> {
+                    let key = StepKeyLR { dir, step: s };
+                    if let Some(v) = measured.get(&key).copied() {
+                        return Ok(v);
+                    }
+
+                    probe_lr_into(
+                        measured,
+                        &probe_left_right_once,
+                        &probe_left_right_zero_candidate,
+                        dir,
+                        s,
+                        zero_candidate,
+                    )
+                };
+
             let mut first_fail_by_dir: BTreeMap<LeftRight, Option<u8>> =
                 BTreeMap::new();
-
-            let mut probe_lr = |dir: LeftRight, s: u8| -> anyhow::Result<(Duration, MarginResult)> {
-                let step = StepLeftRight {
-                    direction: Some(dir),
-                    steps: Steps::from(s),
-                };
-                let (d, r) = probe_left_right_once(step)?;
-                measured.insert(StepKeyLR { dir, step: s }, (d, r));
-                Ok((d, r))
-            };
-
-            let mut probe_lr_zero_candidate =
-                |dir: LeftRight, s: u8| -> anyhow::Result<(Duration, MarginResult)> {
-                    let step = StepLeftRight {
-                        direction: Some(dir),
-                        steps: Steps::from(s),
-                    };
-                    let (d, r) = probe_left_right_zero_candidate(step)?;
-                    measured.insert(StepKeyLR { dir, step: s }, (d, r));
-                    Ok((d, r))
-                };
 
             let mut find_edge_for_dir = |dir: LeftRight| -> anyhow::Result<()> {
                 // Start at max/2 (>=1)
                 let mut s = (max_step / 2).max(1);
-                let (_, mut r) = probe_lr(dir, s)?;
+                let (_, mut r) = probe_lr_cached(&mut measured, dir, s, false)?;
 
                 let mut last_pass: Option<u8> = None;
                 let mut first_fail: Option<u8> = None;
@@ -3560,7 +3620,7 @@ fn margin_lane(
                     // Move inward, halving, until pass or s==1
                     while s > 1 {
                         s = (s / 2).max(1);
-                        let (_, rr) = probe_lr(dir, s)?;
+                        let (_, rr) = probe_lr_cached(&mut measured, dir, s, false)?;
                         r = rr;
                         if !is_fail(&r) {
                             last_pass = Some(s);
@@ -3570,20 +3630,50 @@ fn margin_lane(
                             break;
                         }
                     }
+
                 } else {
                     last_pass = Some(s);
-                    // Move outward, doubling, until fail or max
-                    while s < max_step {
-                        s = (s.saturating_mul(2)).min(max_step);
-                        let (_, rr) = probe_lr(dir, s)?;
+
+                    // ------------------------------------------------------------
+                    // OUTWARD STEP PROGRESSION (TIMING)
+                    //
+                    // Toggle one of the two algorithms below for experiments:
+                    //   A) Odd bounded-growth (voltage-style)
+                    //   B) Classic exponential doubling
+                    //
+                    // Notes:
+                    // - "start" is the smallest allowed step index.
+                    // - "end" is the largest allowed step index (max_step).
+                    // ------------------------------------------------------------
+                    let start: u8 = 1;
+                    let end: u8 = max_step;
+
+                    while s < end {
+                        // ------------------------
+                        // Algorithm A : Odd bounded-growth, grows by an increasing 
+                        // dist but capped by remaining range. 
+                        // ------------------------
+                        let dist = (s - start + 1).min(end - s);
+                        s = (s + dist).min(end);
+
+                        // ------------------------
+                        // Algorithm B (commented out .. testing A vs. B):
+                        // Classic exponential doubling.
+                        // Uncomment this block and comment Algorithm A to test.
+                        // ------------------------
+                        // s = (s.saturating_mul(2)).min(end);
+
+                        let (_, rr) = probe_lr_cached(&mut measured, dir, s, false)?;
                         r = rr;
+
                         if is_fail(&r) {
                             first_fail = Some(s);
                             break;
                         } else {
                             last_pass = Some(s);
                         }
-                        if s == max_step {
+
+                        if s == end {
                             break;
                         }
                     }
@@ -3598,10 +3688,16 @@ fn margin_lane(
                     }
                 };
 
-                // Binary search to minimal failing step.
-                while hi - lo > 1 {
+                // Progressive bracket shrink:
+                // Stop binary shrinking once the bracket is "small enough":
+                // target = clamp(N/16, min=2, max=8)
+                let mut target = max_step / 16;
+                target = target.clamp(FAST_SWEEP_BRACKET_MIN, FAST_SWEEP_BRACKET_MAX);
+
+                // Shrink [lo(pass), hi(fail)] until hi-lo <= target.
+                while hi - lo > target {
                     let mid = lo + (hi - lo) / 2;
-                    let (_, rr) = probe_lr(dir, mid)?;
+                    let (_, rr) = probe_lr_cached(&mut measured, dir, mid, false)?;
                     if is_fail(&rr) {
                         hi = mid;
                     } else {
@@ -3609,25 +3705,76 @@ fn margin_lane(
                     }
                 }
 
+                // Finish inside the small bracket with a triangular progression from lo.
+                // We take 1,2,3,... steps forward (capped), and once we hit a fail,
+                // we linearly scan the remaining sub-range to find the minimal fail.
+                let mut last_pass = lo;
+                let mut s = lo;
+                let mut delta: u8 = 1;
+
+                // Triangular "jump" phase
+                while s < hi {
+                    let next = (s + delta).min(hi);
+                    let (_, rr) = probe_lr_cached(&mut measured, dir, next, false)?;
+                    if is_fail(&rr) {
+                        hi = next;
+                        break;
+                    } else {
+                        last_pass = next;
+                        s = next;
+                        delta = delta.saturating_add(1);
+                    }
+                    if s == hi {
+                        break;
+                    }
+                }
+
+                // Linear finish to the exact minimal failing step (bracket is small here).
+                let mut cand = last_pass.saturating_add(1);
+                while cand <= hi {
+                    let (_, rr) = probe_lr_cached(&mut measured, dir, cand, false)?;
+                    if is_fail(&rr) {
+                        hi = cand;
+                        break;
+                    }
+                    cand = cand.saturating_add(1);
+                }
+
                 // Now hi is the minimal fail step.
                 first_fail_by_dir.insert(dir, Some(hi));
 
-                // Edge confirmation: measure hi-1, then probe inward until we see
-                // at least one 0-error point (cap), and re-probe once for 0-candidates.
+
+                // Edge confirmation:
+                // Always measure hi-1. Then hunt inward for EDGE_ZERO_TARGET 0-error points
+                // (or stop early on a fail). NOTE: 1 is likely enough; try EDGE_ZERO_TARGET=1.
                 let prev = hi.saturating_sub(1);
                 if prev >= 1 {
-                    let (_, r_prev) = probe_lr(dir, prev)?;
-                    if !is_fail(&r_prev) && !is_zero(&r_prev) {
+                    let mut zeros_found: u8 = 0;
+
+                    let (_, r_prev) = probe_lr_cached(&mut measured, dir, prev, false)?;
+                    if is_zero(&r_prev) {
+                        zeros_found = zeros_found.saturating_add(1);
+                    }
+
+                    // Only spend extra probes if we still want more 0-error points.
+                    if zeros_found < EDGE_ZERO_TARGET && !is_fail(&r_prev) {
                         let mut inward = prev;
                         let mut extra_probes = 0u8;
-                        const MAX_EXTRA_INWARD_PROBES: u8 = 2;
+                        // Keep small; EDGE_ZERO_TARGET=1 may be enough and faster.
+                        const MAX_EXTRA_INWARD_PROBES: u8 = 4;
 
-                        while inward > 1 && extra_probes < MAX_EXTRA_INWARD_PROBES {
+                        while inward > 1
+                            && extra_probes < MAX_EXTRA_INWARD_PROBES
+                            && zeros_found < EDGE_ZERO_TARGET
+                        {
                             inward -= 1;
                             extra_probes += 1;
 
-                            let (_, r_in) = probe_lr_zero_candidate(dir, inward)?;
-                            if is_zero(&r_in) || is_fail(&r_in) {
+                            let (_, r_in) = probe_lr_cached(&mut measured, dir, inward, true)?;
+                            if is_zero(&r_in) {
+                                zeros_found = zeros_found.saturating_add(1);
+                            }
+                            if is_fail(&r_in) {
                                 break;
                             }
                         }
@@ -3767,31 +3914,31 @@ fn margin_lane(
             let mut first_fail_by_dir: BTreeMap<UpDown, Option<u8>> =
                 BTreeMap::new();
 
-            let mut probe_ud = |dir: UpDown, s: u8| -> anyhow::Result<(Duration, MarginResult)> {
-                let step = StepUpDown {
-                    direction: Some(dir),
-                    steps: Steps::from(s),
-                };
-                let (d, r) = probe_up_down_once(step)?;
-                measured.insert(StepKeyUD { dir, step: s }, (d, r));
-                Ok((d, r))
-            };
-
-            let mut probe_ud_zero_candidate =
-                |dir: UpDown, s: u8| -> anyhow::Result<(Duration, MarginResult)> {
-                    let step = StepUpDown {
-                        direction: Some(dir),
-                        steps: Steps::from(s),
-                    };
-                    let (d, r) = probe_up_down_zero_candidate(step)?;
-                    measured.insert(StepKeyUD { dir, step: s }, (d, r));
-                    Ok((d, r))
-                };
 
             let mut find_edge_for_dir = |dir: UpDown| -> anyhow::Result<()> {
+                // helper for search
+                let probe_ud_cached =
+                    |measured: &mut BTreeMap<StepKeyUD, (Duration, MarginResult)>,
+                    dir: UpDown,
+                    s: u8,
+                    zero_candidate: bool|
+                    -> anyhow::Result<(Duration, MarginResult)> {
+                        let key = StepKeyUD { dir, step: s };
+                        if let Some(v) = measured.get(&key).copied() {
+                            return Ok(v);
+                        }
+                        probe_ud_into(
+                            measured,
+                            &probe_up_down_once,
+                            &probe_up_down_zero_candidate,
+                            dir,
+                            s,
+                            zero_candidate,
+                        )
+                    };
                 // Start at midpoint of [start, end]
                 let mut s = start + (end - start) / 2;
-                let (_, mut r) = probe_ud(dir, s)?;
+                let (_, mut r) = probe_ud_cached(&mut measured, dir, s, false)?;
 
                 let mut last_pass: Option<u8> = None;
                 let mut first_fail: Option<u8> = None;
@@ -3801,7 +3948,7 @@ fn margin_lane(
                     // Move inward toward start, halving distance to start
                     while s > start {
                         s = start + (s - start) / 2;
-                        let (_, rr) = probe_ud(dir, s)?;
+                        let (_, rr) = probe_ud_cached(&mut measured, dir, s, false)?;
                         r = rr;
                         if !is_fail(&r) {
                             last_pass = Some(s);
@@ -3813,18 +3960,45 @@ fn margin_lane(
                     }
                 } else {
                     last_pass = Some(s);
-                    // Move outward toward end, doubling distance from start (bounded)
+
+                    // ------------------------------------------------------------
+                    // OUTWARD STEP PROGRESSION (VOLTAGE)
+                    //
+                    // Toggle one of the two algorithms below for experiments:
+                    //   A) Odd bounded-growth (current behavior)
+                    //   B) Classic exponential doubling (in offset space)
+                    //
+                    // Notes:
+                    // - Voltage search uses [start, end] due to EDGE_SKIP.
+                    // - For algorithm B (doubling), we double the offset from start.
+                    // ------------------------------------------------------------
                     while s < end {
+                        // ------------------------
+                        // Algorithm A (ENABLED):
+                        // Odd bounded-growth, grows by an increasing dist but capped.
+                        // ------------------------
                         let dist = (s - start + 1).min(end - s);
                         s = (s + dist).min(end);
-                        let (_, rr) = probe_ud(dir, s)?;
+
+                        // ------------------------
+                        // Algorithm B (DISABLED):
+                        // Classic exponential doubling in offset-from-start space.
+                        // Uncomment this block and comment Algorithm A to test.
+                        // ------------------------
+                        // let off = s - start;
+                        // let range = end - start;
+                        // let off2 = off.saturating_mul(2).min(range);
+                        // s = start + off2;
+                        let (_, rr) = probe_ud_cached(&mut measured, dir, s, false)?;
                         r = rr;
+
                         if is_fail(&r) {
                             first_fail = Some(s);
                             break;
                         } else {
                             last_pass = Some(s);
                         }
+
                         if s == end {
                             break;
                         }
@@ -3839,9 +4013,15 @@ fn margin_lane(
                     }
                 };
 
-                while hi - lo > 1 {
+                // Progressive bracket shrink:
+                // target = clamp(N/16, min=2, max=8), computed on the active [start,end] span.
+                let span = end - start;
+                let mut target = span / 16;
+                target = target.clamp(FAST_SWEEP_BRACKET_MIN, FAST_SWEEP_BRACKET_MAX);
+
+                while hi - lo > target {
                     let mid = lo + (hi - lo) / 2;
-                    let (_, rr) = probe_ud(dir, mid)?;
+                    let (_, rr) = probe_ud_cached(&mut measured, dir, mid, false)?;
                     if is_fail(&rr) {
                         hi = mid;
                     } else {
@@ -3849,23 +4029,69 @@ fn margin_lane(
                     }
                 }
 
+                // Triangular finish inside small bracket, then linear to exact minimal fail.
+                let mut last_pass = lo;
+                let mut s = lo;
+                let mut delta: u8 = 1;
+
+                while s < hi {
+                    let next = (s + delta).min(hi);
+                    let (_, rr) = probe_ud_cached(&mut measured, dir, next, false)?;
+                    if is_fail(&rr) {
+                        hi = next;
+                        break;
+                    } else {
+                        last_pass = next;
+                        s = next;
+                        delta = delta.saturating_add(1);
+                    }
+                    if s == hi {
+                        break;
+                    }
+                }
+
+                let mut cand = last_pass.saturating_add(1);
+                while cand <= hi {
+                    let (_, rr) = probe_ud_cached(&mut measured, dir, cand, false)?;
+                    if is_fail(&rr) {
+                        hi = cand;
+                        break;
+                    }
+                    cand = cand.saturating_add(1);
+                }
+
                 first_fail_by_dir.insert(dir, Some(hi));
 
-                // Edge confirmation: hi-1 then hunt for a 0 inward (cap), with re-probe.
+
+                // Edge confirmation (voltage):
+                // Always measure hi-1, then hunt inward for EDGE_ZERO_TARGET 0-error points.
+                // NOTE: 1 is likely enough; try EDGE_ZERO_TARGET=1.
                 let prev = hi.saturating_sub(1);
                 if prev >= start {
-                    let (_, r_prev) = probe_ud(dir, prev)?;
-                    if !is_fail(&r_prev) && !is_zero(&r_prev) {
+                    let mut zeros_found: u8 = 0;
+
+                    let (_, r_prev) = probe_ud_cached(&mut measured, dir, prev, false)?;
+                    if is_zero(&r_prev) {
+                        zeros_found = zeros_found.saturating_add(1);
+                    }
+
+                    if zeros_found < EDGE_ZERO_TARGET && !is_fail(&r_prev) {
                         let mut inward = prev;
                         let mut extra_probes = 0u8;
-                        const MAX_EXTRA_INWARD_PROBES: u8 = 2;
+                        const MAX_EXTRA_INWARD_PROBES: u8 = 4;
 
-                        while inward > start && extra_probes < MAX_EXTRA_INWARD_PROBES {
+                        while inward > start
+                            && extra_probes < MAX_EXTRA_INWARD_PROBES
+                            && zeros_found < EDGE_ZERO_TARGET
+                        {
                             inward -= 1;
                             extra_probes += 1;
 
-                            let (_, r_in) = probe_ud_zero_candidate(dir, inward)?;
-                            if is_zero(&r_in) || is_fail(&r_in) {
+                            let (_, r_in) = probe_ud_cached(&mut measured, dir, inward, true)?;
+                            if is_zero(&r_in) {
+                                zeros_found = zeros_found.saturating_add(1);
+                            }
+                            if is_fail(&r_in) {
                                 break;
                             }
                         }
