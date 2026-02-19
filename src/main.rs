@@ -201,6 +201,12 @@ struct Args {
     #[clap(long = "retry-point")]
     retry_point: bool,
 
+    /// Use a fast sweep strategy to find the margin edge with far fewer
+    /// measured points (exponential bracket + binary search).
+    ///
+    #[clap(long = "fast-sweep")]
+    fast_sweep: bool,
+
     /// Create a zip of the output directory (single-target mode only).
     ///
     /// When probing (-p), results are always zipped. This flag only affects
@@ -3079,6 +3085,7 @@ fn run_margin(
         let error_count = args.error_count;
         let timing = args.timing;
         let voltage = args.voltage;
+        let fast_sweep = args.fast_sweep;
 
         let thr;
         if args.four_point {
@@ -3087,10 +3094,18 @@ fn run_margin(
             });
         } else {
             thr = thread::spawn(move || {
-                margin_lane(margin, duration, error_count, timing, voltage, tx_)
+                margin_lane(
+                    margin,
+                    duration,
+                    error_count,
+                    timing,
+                    voltage,
+                    fast_sweep,
+                    tx_,
+                )
             });
         }
-
+        
         if args.verbose >= verbosity::FILENAME {
             println!("lmar: saving lane {} to \"{}\"", lane, filename);
         }
@@ -3331,6 +3346,18 @@ struct MarginUpdate {
     result: MarginResult,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StepKeyLR {
+    dir: LeftRight,
+    step: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StepKeyUD {
+    dir: UpDown,
+    step: u8,
+}
+
 // Number of consecutive failures needed to trigger early stopping.
 // Once this many consecutive failures are seen in a direction, remaining
 // points in that direction are skipped and synthesized as failures.
@@ -3342,6 +3369,7 @@ fn margin_lane(
     error_count: u8,
     timing: bool,
     voltage: bool,
+    fast_sweep: bool,
     tx: mpsc::Sender<MarginUpdate>,
 ) -> anyhow::Result<()> {
     let lane = margin.lane();
@@ -3356,134 +3384,546 @@ fn margin_lane(
     let timing_resolution = limits.timing_resolution();
     let voltage_resolution = limits.voltage_resolution();
 
-    if timing {
-        // Iterate over the timing steps from center to left and then
-        // center to right.
-        let steps = margin.iter_left_right_steps();
-        let mut consecutive_failures: u8 = 0;
-        let mut current_direction: Option<LeftRight> = None;
-        let mut should_skip_remaining = false;
-
-        for step in steps.into_iter() {
-            // Reset tracking when direction changes.
-            if current_direction != step.direction {
-                consecutive_failures = 0;
-                current_direction = step.direction;
-                should_skip_remaining = false;
-            }
-
-            // Compute the actual time as a percentage of UI that we're
-            // currently margining.
-            let sign = if matches!(step.direction, Some(LeftRight::Left)) {
-                -1.0
-            } else {
-                1.0
-            };
-            let point = MarginPoint::Time(
-                sign * timing_resolution * f64::from(step.steps.0),
-            );
-
-            let (margin_duration, result) = if should_skip_remaining {
-                // Skip the actual margin and synthesize a failure.
-                (
-                    Duration::from_secs(0),
-                    MarginResult::Failed(ErrorCount::from(63)),
-                )
-            } else {
-                // Set up per the spec for margining a single point.
-                margin.clear_error_log()?;
-                margin.go_to_normal_settings()?;
-                margin.no_command()?;
-
-                margin
-                    .margin_at_left_right(step, duration)
-                    .context(format!("Failed to margin point: {step:?}"))?
-            };
-
-            tx.send(MarginUpdate {
-                lane,
-                point,
-                duration: margin_duration,
-                result,
-            })?;
-
-            // Update consecutive failure tracking for early stopping.
-            if !should_skip_remaining {
-                if matches!(result, MarginResult::Failed(_)) {
-                    consecutive_failures += 1;
-                    if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD {
-                        should_skip_remaining = true;
-                    }
-                } else {
-                    consecutive_failures = 0;
-                }
-            }
+    fn result_error_count(result: &MarginResult) -> u8 {
+        match result {
+            MarginResult::Success(c) => u8::from(*c),
+            MarginResult::Failed(c) => u8::from(*c),
         }
     }
 
+    fn is_fail(result: &MarginResult) -> bool {
+        matches!(result, MarginResult::Failed(_))
+    }
+
+    fn is_zero(result: &MarginResult) -> bool {
+        matches!(result, MarginResult::Success(c) if u8::from(*c) == 0)
+    }
+
+    // Probe a point once (includes the standard setup sequence).
+    let mut probe_left_right_once = |step: StepLeftRight| -> anyhow::Result<(Duration, MarginResult)> {
+        margin.clear_error_log()?;
+        margin.go_to_normal_settings()?;
+        margin.no_command()?;
+        let (d, r) = margin
+            .margin_at_left_right(step, duration)
+            .context(format!("Failed to margin point: {step:?}"))?;
+        Ok((d, r))
+    };
+
+    let mut probe_up_down_once = |step: StepUpDown| -> anyhow::Result<(Duration, MarginResult)> {
+        margin.clear_error_log()?;
+        margin.go_to_normal_settings()?;
+        margin.no_command()?;
+        let (d, r) = margin
+            .margin_at_up_down(step, duration)
+            .context(format!("Failed to margin point: {step:?}"))?;
+        Ok((d, r))
+    };
+
+    // For "0-candidate" probes only: if pass but nonzero, re-probe once and
+    // keep the better (lower) error count. Duration is summed.
+    let mut probe_left_right_zero_candidate =
+        |step: StepLeftRight| -> anyhow::Result<(Duration, MarginResult)> {
+            let (d1, r1) = probe_left_right_once(step)?;
+            if !is_fail(&r1) && !is_zero(&r1) {
+                let (d2, r2) = probe_left_right_once(step)?;
+                let c1 = result_error_count(&r1);
+                let c2 = result_error_count(&r2);
+                let best = if c2 < c1 { r2 } else { r1 };
+                Ok((d1 + d2, best))
+            } else {
+                Ok((d1, r1))
+            }
+        };
+
+    let mut probe_up_down_zero_candidate =
+        |step: StepUpDown| -> anyhow::Result<(Duration, MarginResult)> {
+            let (d1, r1) = probe_up_down_once(step)?;
+            if !is_fail(&r1) && !is_zero(&r1) {
+                let (d2, r2) = probe_up_down_once(step)?;
+                let c1 = result_error_count(&r1);
+                let c2 = result_error_count(&r2);
+                let best = if c2 < c1 { r2 } else { r1 };
+                Ok((d1 + d2, best))
+            } else {
+                Ok((d1, r1))
+            }
+        };
+
+
+    if timing {
+        if !fast_sweep {
+            // Legacy full sweep behavior.
+            let steps = margin.iter_left_right_steps();
+            let mut consecutive_failures: u8 = 0;
+            let mut current_direction: Option<LeftRight> = None;
+            let mut should_skip_remaining = false;
+
+            for step in steps.into_iter() {
+                if current_direction != step.direction {
+                    consecutive_failures = 0;
+                    current_direction = step.direction;
+                    should_skip_remaining = false;
+                }
+
+                let sign = if matches!(step.direction, Some(LeftRight::Left)) {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let point = MarginPoint::Time(
+                    sign * timing_resolution * f64::from(step.steps.0),
+                );
+
+                let (margin_duration, result) = if should_skip_remaining {
+                    (
+                        Duration::from_secs(0),
+                        MarginResult::Failed(ErrorCount::from(63)),
+                    )
+                } else {
+                    margin.clear_error_log()?;
+                    margin.go_to_normal_settings()?;
+                    margin.no_command()?;
+
+                    margin
+                        .margin_at_left_right(step, duration)
+                        .context(format!("Failed to margin point: {step:?}"))?
+                };
+
+                tx.send(MarginUpdate {
+                    lane,
+                    point,
+                    duration: margin_duration,
+                    result,
+                })?;
+
+                if !should_skip_remaining {
+                    if matches!(result, MarginResult::Failed(_)) {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD {
+                            should_skip_remaining = true;
+                        }
+                    } else {
+                        consecutive_failures = 0;
+                    }
+                }
+            }
+        } else {
+            // Fast sweep (dense output):
+            // - Probe only O(log N) points per direction to find edge
+            // - Ensure edge packet includes a nearby 0-error point (capped),
+            //   with a cheap re-probe mitigation for 0-candidates
+            // - Emit a full, dense set of updates in canonical order, filling
+            //   unmeasured points with Success(0) or Failed(63)
+
+            let max_step = limits.num_timing_steps;
+
+            // Measured points stored here; we will emit everything at the end.
+            let mut measured: BTreeMap<StepKeyLR, (Duration, MarginResult)> =
+                BTreeMap::new();
+
+            // Per-direction edge info: first failing step, if any.
+            let mut first_fail_by_dir: BTreeMap<LeftRight, Option<u8>> =
+                BTreeMap::new();
+
+            let mut probe_lr = |dir: LeftRight, s: u8| -> anyhow::Result<(Duration, MarginResult)> {
+                let step = StepLeftRight {
+                    direction: Some(dir),
+                    steps: Steps::from(s),
+                };
+                let (d, r) = probe_left_right_once(step)?;
+                measured.insert(StepKeyLR { dir, step: s }, (d, r));
+                Ok((d, r))
+            };
+
+            let mut probe_lr_zero_candidate =
+                |dir: LeftRight, s: u8| -> anyhow::Result<(Duration, MarginResult)> {
+                    let step = StepLeftRight {
+                        direction: Some(dir),
+                        steps: Steps::from(s),
+                    };
+                    let (d, r) = probe_left_right_zero_candidate(step)?;
+                    measured.insert(StepKeyLR { dir, step: s }, (d, r));
+                    Ok((d, r))
+                };
+
+            let mut find_edge_for_dir = |dir: LeftRight| -> anyhow::Result<()> {
+                // Start at max/2 (>=1)
+                let mut s = (max_step / 2).max(1);
+                let (_, mut r) = probe_lr(dir, s)?;
+
+                let mut last_pass: Option<u8> = None;
+                let mut first_fail: Option<u8> = None;
+
+                if is_fail(&r) {
+                    first_fail = Some(s);
+                    // Move inward, halving, until pass or s==1
+                    while s > 1 {
+                        s = (s / 2).max(1);
+                        let (_, rr) = probe_lr(dir, s)?;
+                        r = rr;
+                        if !is_fail(&r) {
+                            last_pass = Some(s);
+                            break;
+                        }
+                        if s == 1 {
+                            break;
+                        }
+                    }
+                } else {
+                    last_pass = Some(s);
+                    // Move outward, doubling, until fail or max
+                    while s < max_step {
+                        s = (s.saturating_mul(2)).min(max_step);
+                        let (_, rr) = probe_lr(dir, s)?;
+                        r = rr;
+                        if is_fail(&r) {
+                            first_fail = Some(s);
+                            break;
+                        } else {
+                            last_pass = Some(s);
+                        }
+                        if s == max_step {
+                            break;
+                        }
+                    }
+                }
+
+                // If we never found a failure, record None and return.
+                let (mut lo, mut hi) = match (last_pass, first_fail) {
+                    (Some(lp), Some(ff)) if lp < ff => (lp, ff),
+                    _ => {
+                        first_fail_by_dir.insert(dir, None);
+                        return Ok(());
+                    }
+                };
+
+                // Binary search to minimal failing step.
+                while hi - lo > 1 {
+                    let mid = lo + (hi - lo) / 2;
+                    let (_, rr) = probe_lr(dir, mid)?;
+                    if is_fail(&rr) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+
+                // Now hi is the minimal fail step.
+                first_fail_by_dir.insert(dir, Some(hi));
+
+                // Edge confirmation: measure hi-1, then probe inward until we see
+                // at least one 0-error point (cap), and re-probe once for 0-candidates.
+                let prev = hi.saturating_sub(1);
+                if prev >= 1 {
+                    let (_, r_prev) = probe_lr(dir, prev)?;
+                    if !is_fail(&r_prev) && !is_zero(&r_prev) {
+                        let mut inward = prev;
+                        let mut extra_probes = 0u8;
+                        const MAX_EXTRA_INWARD_PROBES: u8 = 2;
+
+                        while inward > 1 && extra_probes < MAX_EXTRA_INWARD_PROBES {
+                            inward -= 1;
+                            extra_probes += 1;
+
+                            let (_, r_in) = probe_lr_zero_candidate(dir, inward)?;
+                            if is_zero(&r_in) || is_fail(&r_in) {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            };
+
+            // Run directions that are actually supported by the device behavior.
+            // (Matches the legacy step generation shape.)
+            find_edge_for_dir(LeftRight::Right)?;
+            if margin.capabilities().independent_left_right_sampling {
+                find_edge_for_dir(LeftRight::Left)?;
+            }
+
+            // Emit dense updates in canonical order (legacy order).
+            let steps = margin.iter_left_right_steps();
+            for step in steps.into_iter() {
+                let dir = step.direction.expect("LR step must have a direction");
+                let s = step.steps.0;
+
+                let key = StepKeyLR { dir, step: s };
+                let (d, r) = if let Some((d, r)) = measured.get(&key).copied() {
+                    (d, r)
+                } else {
+                    // Synthesize based on discovered edge for this direction:
+                    // - If no failure ever found: all synthesized as Success(0)
+                    // - Else: steps < first_fail => Success(0), steps >= first_fail => Failed(63)
+                    match first_fail_by_dir.get(&dir).copied().flatten() {
+                        None => (
+                            Duration::from_secs(0),
+                            MarginResult::Success(ErrorCount::from(0)),
+                        ),
+                        Some(ff) => {
+                            if s < ff {
+                                (
+                                    Duration::from_secs(0),
+                                    MarginResult::Success(ErrorCount::from(0)),
+                                )
+                            } else {
+                                (
+                                    Duration::from_secs(0),
+                                    MarginResult::Failed(ErrorCount::from(63)),
+                                )
+                            }
+                        }
+                    }
+                };
+
+                let sign = if matches!(dir, LeftRight::Left) { -1.0 } else { 1.0 };
+                let point = MarginPoint::Time(sign * timing_resolution * f64::from(s));
+
+                tx.send(MarginUpdate {
+                    lane,
+                    point,
+                    duration: d,
+                    result: r,
+                })?;
+            }
+        }
+    }
     // Iterate over the voltage steps, if supported.
     if voltage && capabilities.voltage_supported {
-        let steps = margin.iter_up_down_steps();
-        let mut consecutive_failures: u8 = 0;
-        let mut current_direction: Option<UpDown> = None;
-        let mut should_skip_remaining = false;
+        if !fast_sweep {
+            // Legacy full sweep behavior.
+            let steps = margin.iter_up_down_steps();
+            let mut consecutive_failures: u8 = 0;
+            let mut current_direction: Option<UpDown> = None;
+            let mut should_skip_remaining = false;
 
-        for step in steps.into_iter() {
-            // Reset tracking when direction changes.
-            if current_direction != step.direction {
-                consecutive_failures = 0;
-                current_direction = step.direction;
-                should_skip_remaining = false;
+            for step in steps.into_iter() {
+                if current_direction != step.direction {
+                    consecutive_failures = 0;
+                    current_direction = step.direction;
+                    should_skip_remaining = false;
+                }
+
+                let sign = if matches!(step.direction, Some(UpDown::Down)) {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let point = MarginPoint::Voltage(
+                    sign * voltage_resolution * f64::from(step.steps.0),
+                );
+
+                let (margin_duration, result) = if should_skip_remaining {
+                    (
+                        Duration::from_secs(0),
+                        MarginResult::Failed(ErrorCount::from(63)),
+                    )
+                } else {
+                    margin.clear_error_log()?;
+                    margin.go_to_normal_settings()?;
+                    margin.no_command()?;
+
+                    margin
+                        .margin_at_up_down(step, duration)
+                        .context(format!("Failed to margin point: {step:?}"))?
+                };
+
+                tx.send(MarginUpdate {
+                    lane,
+                    point,
+                    duration: margin_duration,
+                    result,
+                })?;
+
+                if !should_skip_remaining {
+                    if matches!(result, MarginResult::Failed(_)) {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD {
+                            should_skip_remaining = true;
+                        }
+                    } else {
+                        consecutive_failures = 0;
+                    }
+                }
+            }
+        } else {
+            // Fast sweep voltage (dense output), matching iter_up_down_steps() shape.
+            const EDGE_SKIP: u8 = 2;
+
+            let max_step = limits
+                .num_voltage_steps
+                .expect("Voltage supported but num_voltage_steps missing");
+
+            let start = 1u8.saturating_add(EDGE_SKIP);
+            let end = max_step.saturating_sub(EDGE_SKIP);
+            if end < start {
+                return Ok(());
             }
 
-            // Compute the actual voltage at which we're margining.
-            let sign = if matches!(step.direction, Some(UpDown::Down)) {
-                -1.0
-            } else {
-                1.0
-            };
-            let point = MarginPoint::Voltage(
-                sign * voltage_resolution * f64::from(step.steps.0),
-            );
+            let mut measured: BTreeMap<StepKeyUD, (Duration, MarginResult)> =
+                BTreeMap::new();
+            let mut first_fail_by_dir: BTreeMap<UpDown, Option<u8>> =
+                BTreeMap::new();
 
-            let (margin_duration, result) = if should_skip_remaining {
-                // Skip the actual margin and synthesize a failure.
-                (
-                    Duration::from_secs(0),
-                    MarginResult::Failed(ErrorCount::from(63)),
-                )
-            } else {
-                // Set up per the spec for margining a single point.
-                margin.clear_error_log()?;
-                margin.go_to_normal_settings()?;
-                margin.no_command()?;
-
-                margin
-                    .margin_at_up_down(step, duration)
-                    .context(format!("Failed to margin point: {step:?}"))?
+            let mut probe_ud = |dir: UpDown, s: u8| -> anyhow::Result<(Duration, MarginResult)> {
+                let step = StepUpDown {
+                    direction: Some(dir),
+                    steps: Steps::from(s),
+                };
+                let (d, r) = probe_up_down_once(step)?;
+                measured.insert(StepKeyUD { dir, step: s }, (d, r));
+                Ok((d, r))
             };
 
-            tx.send(MarginUpdate {
-                lane,
-                point,
-                duration: margin_duration,
-                result,
-            })?;
+            let mut probe_ud_zero_candidate =
+                |dir: UpDown, s: u8| -> anyhow::Result<(Duration, MarginResult)> {
+                    let step = StepUpDown {
+                        direction: Some(dir),
+                        steps: Steps::from(s),
+                    };
+                    let (d, r) = probe_up_down_zero_candidate(step)?;
+                    measured.insert(StepKeyUD { dir, step: s }, (d, r));
+                    Ok((d, r))
+                };
 
-            // Update consecutive failure tracking for early stopping.
-            if !should_skip_remaining {
-                if matches!(result, MarginResult::Failed(_)) {
-                    consecutive_failures += 1;
-                    if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD {
-                        should_skip_remaining = true;
+            let mut find_edge_for_dir = |dir: UpDown| -> anyhow::Result<()> {
+                // Start at midpoint of [start, end]
+                let mut s = start + (end - start) / 2;
+                let (_, mut r) = probe_ud(dir, s)?;
+
+                let mut last_pass: Option<u8> = None;
+                let mut first_fail: Option<u8> = None;
+
+                if is_fail(&r) {
+                    first_fail = Some(s);
+                    // Move inward toward start, halving distance to start
+                    while s > start {
+                        s = start + (s - start) / 2;
+                        let (_, rr) = probe_ud(dir, s)?;
+                        r = rr;
+                        if !is_fail(&r) {
+                            last_pass = Some(s);
+                            break;
+                        }
+                        if s == start {
+                            break;
+                        }
                     }
                 } else {
-                    consecutive_failures = 0;
+                    last_pass = Some(s);
+                    // Move outward toward end, doubling distance from start (bounded)
+                    while s < end {
+                        let dist = (s - start + 1).min(end - s);
+                        s = (s + dist).min(end);
+                        let (_, rr) = probe_ud(dir, s)?;
+                        r = rr;
+                        if is_fail(&r) {
+                            first_fail = Some(s);
+                            break;
+                        } else {
+                            last_pass = Some(s);
+                        }
+                        if s == end {
+                            break;
+                        }
+                    }
                 }
+
+                let (mut lo, mut hi) = match (last_pass, first_fail) {
+                    (Some(lp), Some(ff)) if lp < ff => (lp, ff),
+                    _ => {
+                        first_fail_by_dir.insert(dir, None);
+                        return Ok(());
+                    }
+                };
+
+                while hi - lo > 1 {
+                    let mid = lo + (hi - lo) / 2;
+                    let (_, rr) = probe_ud(dir, mid)?;
+                    if is_fail(&rr) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+
+                first_fail_by_dir.insert(dir, Some(hi));
+
+                // Edge confirmation: hi-1 then hunt for a 0 inward (cap), with re-probe.
+                let prev = hi.saturating_sub(1);
+                if prev >= start {
+                    let (_, r_prev) = probe_ud(dir, prev)?;
+                    if !is_fail(&r_prev) && !is_zero(&r_prev) {
+                        let mut inward = prev;
+                        let mut extra_probes = 0u8;
+                        const MAX_EXTRA_INWARD_PROBES: u8 = 2;
+
+                        while inward > start && extra_probes < MAX_EXTRA_INWARD_PROBES {
+                            inward -= 1;
+                            extra_probes += 1;
+
+                            let (_, r_in) = probe_ud_zero_candidate(dir, inward)?;
+                            if is_zero(&r_in) || is_fail(&r_in) {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            };
+
+            // Match legacy shape: Up always; Down only if independent.
+            find_edge_for_dir(UpDown::Up)?;
+            if margin.capabilities().independent_up_down_voltage {
+                find_edge_for_dir(UpDown::Down)?;
+            }
+
+            // Emit dense updates in canonical legacy order.
+            let steps = margin.iter_up_down_steps();
+            for step in steps.into_iter() {
+                let dir = step.direction.expect("UD step must have a direction");
+                let s = step.steps.0;
+
+                let key = StepKeyUD { dir, step: s };
+                let (d, r) = if let Some((d, r)) = measured.get(&key).copied() {
+                    (d, r)
+                } else {
+                    match first_fail_by_dir.get(&dir).copied().flatten() {
+                        None => (
+                            Duration::from_secs(0),
+                            MarginResult::Success(ErrorCount::from(0)),
+                        ),
+                        Some(ff) => {
+                            if s < ff {
+                                (
+                                    Duration::from_secs(0),
+                                    MarginResult::Success(ErrorCount::from(0)),
+                                )
+                            } else {
+                                (
+                                    Duration::from_secs(0),
+                                    MarginResult::Failed(ErrorCount::from(63)),
+                                )
+                            }
+                        }
+                    }
+                };
+
+                let sign = if matches!(dir, UpDown::Down) { -1.0 } else { 1.0 };
+                let point = MarginPoint::Voltage(sign * voltage_resolution * f64::from(s));
+
+                tx.send(MarginUpdate {
+                    lane,
+                    point,
+                    duration: d,
+                    result: r,
+                })?;
             }
         }
     }
-
     Ok(())
 }
 
