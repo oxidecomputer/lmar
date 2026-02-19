@@ -1976,7 +1976,7 @@ impl LaneMargin {
 }
 
 /// A PCIe Bus/Device/Function, representing a single PCIe receiver.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bdf {
     bus: u8,
     device: u8,
@@ -2939,10 +2939,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let device = match args.bdf {
-        Some(bdf) => {
-            PcieDevice::new(bdf).context("Failed to create PCIe device")?
-        }
+    let bdf = match args.bdf {
+        Some(bdf) => bdf,
         None => {
             return Err(ClapError::raw(
                 ErrorKind::MissingRequiredArgument,
@@ -2951,6 +2949,27 @@ fn main() -> anyhow::Result<()> {
             .into());
         }
     };
+
+    // Validate the BDF against the devinfo device tree before touching
+    // pcitool.  enum_pcie_devices() uses devinfo (safe kernel tree walk,
+    // no hardware ioctl), so an invalid BDF is caught here rather than
+    // hanging the system on a pcitool write to a non-existent device.
+    let bridges = enum_pcie_devices()
+        .context("Failed to enumerate PCIe devices for BDF validation")?;
+    let bdf_known = bridges.iter().any(|b| {
+        b.bridge.device.bdf == bdf
+            || b.children.iter().any(|c| c.device.bdf == bdf)
+    });
+    if !bdf_known {
+        return Err(anyhow::anyhow!(
+            "BDF {} not found among active PCIe devices; \
+             run with -p to list available devices",
+            bdf
+        ));
+    }
+
+    let device =
+        PcieDevice::new(bdf).context("Failed to create PCIe device")?;
 
     let link_status =
         device.link_status().context("Failed to get link status")?;
@@ -3682,6 +3701,15 @@ fn margin_lane(
                 // If we never found a failure, record None and return.
                 let (mut lo, mut hi) = match (last_pass, first_fail) {
                     (Some(lp), Some(ff)) if lp < ff => (lp, ff),
+                    // No pass found at all: every probed step failed.
+                    // Treat as fail from step 1 so the emitter synthesizes
+                    // all steps as Failed(63) rather than incorrectly Success(0).
+                    (None, Some(_)) => {
+                        first_fail_by_dir.insert(dir, Some(1));
+                        return Ok(());
+                    }
+                    // No failure found (all steps pass), or other degenerate
+                    // case: synthesize all as Success(0).
                     _ => {
                         first_fail_by_dir.insert(dir, None);
                         return Ok(());
@@ -3823,6 +3851,15 @@ fn margin_lane(
                             }
                         }
                     }
+                };
+                // Normalize all failed points to max error count.
+                // Measured failures may return a device-specific value (e.g. 5);
+                // force to 63 so the output presents a flat line across bad points.
+                // TODO: replace the literal 63 with a named const (e.g.
+                // ERROR_COUNT_MAX) once one is defined for ErrorCount.
+                let r = match r {
+                    MarginResult::Failed(_) => MarginResult::Failed(ErrorCount::from(63)),
+                    other => other,
                 };
 
                 let sign = if matches!(dir, LeftRight::Left) { -1.0 } else { 1.0 };
@@ -4007,6 +4044,15 @@ fn margin_lane(
 
                 let (mut lo, mut hi) = match (last_pass, first_fail) {
                     (Some(lp), Some(ff)) if lp < ff => (lp, ff),
+                    // No pass found at all: every probed step failed.
+                    // Treat as fail from `start` so the emitter synthesizes
+                    // all steps as Failed(63) rather than incorrectly Success(0).
+                    (None, Some(_)) => {
+                        first_fail_by_dir.insert(dir, Some(start));
+                        return Ok(());
+                    }
+                    // No failure found (all steps pass), or other degenerate
+                    // case: synthesize all as Success(0).
                     _ => {
                         first_fail_by_dir.insert(dir, None);
                         return Ok(());
@@ -4136,6 +4182,15 @@ fn margin_lane(
                             }
                         }
                     }
+                };
+                // Normalize all failed points to max error count.
+                // Measured failures may return a device-specific value (e.g. 5);
+                // force to 63 so the output presents a flat line across bad points.
+                // TODO: replace the literal 63 with a named const (e.g.
+                // ERROR_COUNT_MAX) once one is defined for ErrorCount.
+                let r = match r {
+                    MarginResult::Failed(_) => MarginResult::Failed(ErrorCount::from(63)),
+                    other => other,
                 };
 
                 let sign = if matches!(dir, UpDown::Down) { -1.0 } else { 1.0 };
