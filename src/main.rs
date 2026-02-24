@@ -119,6 +119,7 @@ impl std::str::FromStr for LaneDescription {
 
 #[derive(Parser, Clone, Debug)]
 #[clap(author, version, about, long_about = None)]
+#[clap(max_term_width = 80)]
 /// The `lmar` program is a prototype tool to run the PCIe Lane Margining at the
 /// Receiver protocol on an attached PCIe endpoint.
 ///
@@ -162,8 +163,8 @@ struct Args {
     /// If the number of errors is not greater than this value, margining is
     /// deemed to succeed. Any value greater than this is a failure at that
     /// margining point.
-    #[clap(short, long)]
-    error_count: Option<u8>,
+    #[clap(short, long, default_value_t = 22)]
+    error_count: u8,
 
     /// Print verbose information about the device and margining process.
     #[clap(short, long, parse(from_occurrences))]
@@ -187,6 +188,19 @@ struct Args {
     #[clap(short = '4', long = "four-point")]
     four_point: bool,
 
+    /// Force parallel scanning of ports that do not support an independent
+    /// error sampler when probing (-p).
+    #[clap(short = 'F', long = "force-parallel")]
+    force_parallel: bool,
+
+    /// Margin lanes serially (one at a time) instead of in parallel.
+    #[clap(long = "serial-lanes")]
+    serial_lanes: bool,
+
+    /// Retry a margin point once on timeout or error.
+    #[clap(long = "retry-point")]
+    retry_point: bool,
+
     /// Create a zip of the output directory (single-target mode only).
     ///
     /// When probing (-p), results are always zipped. This flag only affects
@@ -194,19 +208,33 @@ struct Args {
     #[clap(short = 'z', long = "zip")]
     zip: bool,
 
-    /// Don't run Timing margining.
+    /// Don't run timing margining.
     #[clap(long = "no-timing", action = ArgAction::SetFalse)]
     timing: bool,
     /// Run timing margining [default].
     #[clap(long = "timing", overrides_with = "timing")]
     _no_timing: bool,
 
-    /// Don't run Voltage margining.
+    /// Don't run voltage margining.
     #[clap(long = "no-voltage", action = ArgAction::SetFalse)]
     voltage: bool,
     /// Run Voltage margining if supported [default].
     #[clap(long = "voltage", overrides_with = "voltage")]
     _no_voltage: bool,
+
+    /// Don't margin bridges when probing (-p).
+    #[clap(long = "no-bridges", action = ArgAction::SetFalse)]
+    bridges: bool,
+    /// Margin the bridges when probing (-p) [default].
+    #[clap(long = "bridges", overrides_with = "bridges")]
+    _no_bridges: bool,
+
+    /// Don't margin child devices when probing (-p).
+    #[clap(long = "no-children", action = ArgAction::SetFalse)]
+    children: bool,
+    /// Margin the children when probing (-p) [default].
+    #[clap(long = "children", overrides_with = "children")]
+    _no_children: bool,
 }
 
 /// Errors working with a PCIe device
@@ -218,7 +246,10 @@ pub enum Error {
     #[error("Invalid PCIe read encountered: offset {0:#x}, data: {1:#x}")]
     InvalidPcieRead(usize, u64),
 
-    #[error("Invalid value for a PCIe configuration parameter '{parameter}': {value}")]
+    #[error(
+        "Invalid value for a PCIe configuration parameter \
+         '{parameter}': {value}"
+    )]
     InvalidPcieParameter { parameter: &'static str, value: u64 },
 
     #[error("Unsupported PCIe extended capability: {0:?}")]
@@ -691,6 +722,12 @@ impl MarginCommand {
                 MarginCommand::SetErrorCountLimit(_),
                 MarginResponse::ErrorCountLimit(_),
             ) => true,
+            // Some devices respond with NoCommand instead of
+            // ErrorCountLimit (non-compliant)
+            (
+                MarginCommand::SetErrorCountLimit(_),
+                MarginResponse::NoCommand,
+            ) => true,
             (
                 MarginCommand::GoToNormalSettings,
                 MarginResponse::GoToNormalSettings,
@@ -776,7 +813,7 @@ impl From<u8> for ReportRequest {
 #[allow(dead_code)]
 pub struct ReportCapabilities {
     independent_error_sampler: bool,
-    sample_reporting_method: SampleReportingMethod,
+    pub sample_reporting_method: SampleReportingMethod,
     independent_left_right_sampling: bool,
     independent_up_down_voltage: bool,
     voltage_supported: bool,
@@ -817,6 +854,24 @@ impl From<ReportCapabilities> for u8 {
                 0
             }
             | (r.independent_error_sampler as u8) << 4
+    }
+}
+
+impl ReportCapabilities {
+    pub fn supports_error_count_limit(&self) -> bool {
+        self.independent_error_sampler
+            && matches!(
+                self.sample_reporting_method,
+                SampleReportingMethod::Count
+            )
+    }
+
+    pub fn is_rate_based(&self) -> bool {
+        matches!(self.sample_reporting_method, SampleReportingMethod::Rate)
+    }
+
+    pub fn has_independent_error_sampler(&self) -> bool {
+        self.independent_error_sampler
     }
 }
 
@@ -876,7 +931,7 @@ pub struct ErrorCount(u8);
 
 impl From<u8> for ErrorCount {
     fn from(word: u8) -> Self {
-        Self(word & 0b11111)
+        Self(word & 0b111111)
     }
 }
 
@@ -912,7 +967,7 @@ impl From<u8> for StepLeftRight {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LeftRight {
     Left,
     Right,
@@ -963,7 +1018,7 @@ impl From<u8> for StepUpDown {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UpDown {
     Up,
     Down,
@@ -1261,6 +1316,7 @@ struct LaneMarginInner {
     cmd_offset: usize,
     sts_offset: usize,
     verbosity: u64,
+    retry_point: bool,
 }
 
 impl LaneMarginInner {
@@ -1306,7 +1362,8 @@ impl LaneMarginInner {
         match self.wait_for_response(cmd)? {
             MarginResponse::ClearErrorLog => Ok(()),
             other => Err(Error::Margin(format!(
-                "Margining failed, expected Clear Error Log response, found: {:?}",
+                "Margining failed, expected Clear Error Log response, \
+                 found: {:?}",
                 other
             ))),
         }
@@ -1318,7 +1375,8 @@ impl LaneMarginInner {
         match self.wait_for_response(cmd)? {
             MarginResponse::GoToNormalSettings => Ok(()),
             other => Err(Error::Margin(format!(
-                "Margining failed, expected Go To Normal Settings response, found: {:?}",
+                "Margining failed, expected Go To Normal Settings \
+                 response, found: {:?}",
                 other
             ))),
         }
@@ -1348,7 +1406,8 @@ impl LaneMarginInner {
         &self,
         cmd: MarginCommand,
     ) -> Result<MarginResponse, Error> {
-        // increased these from 10 -> 100, 250 to see if RC port failure is fixed
+        // increased these from 10 -> 100, 250 to see if RC port
+        // failure is fixed
         const WAIT_INTERVAL: Duration = Duration::from_micros(100);
         const MAX_WAIT_TIME: Duration = Duration::from_millis(250);
         let now = Instant::now();
@@ -1490,7 +1549,8 @@ impl LaneMarginInner {
                 }
                 other => {
                     return Err(Error::Margin(format!(
-                        "Unexpected response requesting SamplingRateVoltage: {:?}",
+                        "Unexpected response requesting \
+                         SamplingRateVoltage: {:?}",
                         other
                     )));
                 }
@@ -1534,46 +1594,64 @@ impl LaneMarginInner {
                     Ok(())
                 } else {
                     Err(Error::Margin(format!(
-                        "Failed to set error count limit"
+                        "Failed to set error count limit: requested {}, got {}",
+                        u8::from(limit),
+                        u8::from(actual_limit)
                     )))
                 }
             }
+            // Some devices respond with NoCommand instead of echoing the value.
+            // This is non-compliant behavior, but we accept it as success.
+            MarginResponse::NoCommand => {
+                if self.verbosity >= verbosity::COMMANDS {
+                    eprintln!(
+                        "Warning: device responded with NoCommand to \
+                         SetErrorCountLimit({}) (non-compliant behavior, \
+                         accepting as success)",
+                        count
+                    );
+                }
+                Ok(())
+            }
             _ => Err(Error::Margin(format!(
-                "Expected set error limit response, found: {response:?})"
+                "Expected ErrorCountLimit or NoCommand response, \
+                 found: {response:?})"
             ))),
         }
     }
 
     fn margin_at(
-	&self,
-	cmd: MarginCommand,
-	duration: Duration,
+        &self,
+        cmd: MarginCommand,
+        duration: Duration,
     ) -> Result<(Duration, MarginResult), Error> {
-	// Retry once on setup timeout.
-	for attempt in 0..=1 {
-	    match self.margin_at_once(cmd, duration) {
-		Ok(v) => return Ok(v),
-		Err(e) => {
-		    let msg = e.to_string();
-		    let is_setup_timeout =
-			msg.contains("Failed to finish margin setup within");
+        // Retry once on setup timeout, or on any error if retry_point
+        // is enabled.
+        for attempt in 0..=1 {
+            match self.margin_at_once(cmd, duration) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_setup_timeout =
+                        msg.contains("Failed to finish margin setup within");
+                    let should_retry =
+                        is_setup_timeout || self.retry_point;
 
-		    if !is_setup_timeout || attempt == 1 {
-			return Err(e);
-		    }
+                    if !should_retry || attempt == 1 {
+                        return Err(e);
+                    }
 
-		    // Recover + retry.
-		    let _ = self.no_command();
-		    let _ = self.clear_error_log();
-		    let _ = self.no_command();
-		    let _ = self.go_to_normal_settings();
-		    sleep(Duration::from_millis(50));
-		}
-	    }
-	}
-	unreachable!()
+                    // Recover + retry.
+                    let _ = self.no_command();
+                    let _ = self.clear_error_log();
+                    let _ = self.no_command();
+                    let _ = self.go_to_normal_settings();
+                    sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        unreachable!()
     }
-
 
     fn margin_at_once(
         &self,
@@ -1590,7 +1668,7 @@ impl LaneMarginInner {
 
         // counters for NaN error info
         let mut setup_polls: u32 = 0;
-        let mut last_error_count: Option<ErrorCount> = None;
+        let mut _last_error_count: Option<ErrorCount> = None;
         let now = Instant::now();
         loop {
             let response = self.wait_for_response(cmd)?;
@@ -1605,15 +1683,16 @@ impl LaneMarginInner {
 
                         StepMarginExecutionStatus::Setup => {
                             setup_polls += 1;
-                            last_error_count = Some(error_count);
+                            _last_error_count = Some(error_count);
 
                             if now.elapsed() > TOTAL_DURATION {
                                 return Err(Error::Margin(format!(
-                                    "Failed to finish margin setup within {:?} \
-                                      (polls={}, last_error_count={:?}, cmd={:?})",
+                                    "Failed to finish margin setup within \
+                                     {:?} (polls={}, last_error_count={:?}, \
+                                     cmd={:?})",
                                     TOTAL_DURATION,
                                     setup_polls,
-                                    last_error_count,
+                                    _last_error_count,
                                     cmd,
                                 )));
                             }
@@ -1630,7 +1709,8 @@ impl LaneMarginInner {
                 }
                 _ => {
                     return Err(Error::Margin(format!(
-                        "Expected step execution status response, found: {response:?})"
+                        "Expected step execution status response, \
+                         found: {response:?})"
                     )));
                 }
             }
@@ -1661,7 +1741,8 @@ impl LaneMarginInner {
             }
             _ => {
                 return Err(Error::Margin(format!(
-                    "Margining failed, expected step margin execution status with InProgress, found {:?}",
+                    "Margining failed, expected step margin execution \
+                     status with InProgress, found {:?}",
                     response,
                 )));
             }
@@ -1689,6 +1770,15 @@ impl MarginingLimits {
             self.num_voltage_steps.replace(steps);
         }
     }
+    pub fn timing_resolution(self) -> f64 {
+        f64::from(self.max_timing_offset) / f64::from(self.num_timing_steps)
+    }
+    pub fn voltage_resolution(self) -> f64 {
+        match (self.max_voltage_offset, self.num_voltage_steps) {
+            (Some(max), Some(num)) => (f64::from(max) / f64::from(num)) / 100.0,
+            _ => 0.0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1704,12 +1794,14 @@ impl LaneMargin {
         receiver: Receiver,
         lane: Lane,
         verbosity: u64,
+        retry: bool,
     ) -> Result<Self, Error> {
         // Find the size of the capability header, limited to the width of the
         // link.
         let link_status = device.link_status()?;
         let n_lanes = usize::from(u8::from(link_status.width));
-        // 2 u16s for each lane (control / status) + 2 for the port capability / status
+        // 2 u16s for each lane (control / status) + 2 for the port
+        // capability / status
         let n_bytes = (n_lanes + 1) * std::mem::size_of::<u16>() * 2;
         let data = device.read_extended_capability_data::<u8>(
             &ExtendedCapabilityId::LaneMargining,
@@ -1725,7 +1817,8 @@ impl LaneMargin {
             .find_extended_capability(&ExtendedCapabilityId::LaneMargining)
             .ok_or_else(|| {
                 Error::Margin(format!(
-                    "Failed to read offset of Lane Margining extended capability"
+                    "Failed to read offset of Lane Margining extended \
+                     capability"
                 ))
             })?
             .0;
@@ -1739,6 +1832,7 @@ impl LaneMargin {
             cmd_offset,
             sts_offset,
             verbosity,
+            retry_point: retry,
         };
         let capabilities = inner.report_capabilities()?;
         inner.no_command()?;
@@ -1772,6 +1866,10 @@ impl LaneMargin {
 
     pub fn supports_voltage_margining(&self) -> bool {
         self.limits.num_voltage_steps.is_some()
+    }
+
+    pub fn supports_error_count_limit(&self) -> bool {
+        self.capabilities.supports_error_count_limit()
     }
 
     pub fn limits(&self) -> &MarginingLimits {
@@ -1824,13 +1922,12 @@ impl LaneMargin {
         });
 
         if self.capabilities().independent_left_right_sampling {
-            base.rev()
-                .map(|pt| StepLeftRight {
-                    direction: Some(LeftRight::Left),
-                    steps: Steps::from(pt),
-                })
+            base.map(|pt| StepLeftRight {
+                direction: Some(LeftRight::Left),
+                steps: Steps::from(pt),
+            })
             .chain(right)
-                .collect()
+            .collect()
         } else {
             right.collect()
         }
@@ -1855,13 +1952,12 @@ impl LaneMargin {
                 });
 
                 if self.capabilities().independent_up_down_voltage {
-                    base.rev()
-                        .map(|pt| StepUpDown {
-                            direction: Some(UpDown::Down),
-                            steps: Steps::from(pt),
-                        })
+                    base.map(|pt| StepUpDown {
+                        direction: Some(UpDown::Down),
+                        steps: Steps::from(pt),
+                    })
                     .chain(up)
-                        .collect()
+                    .collect()
                 } else {
                     up.collect()
                 }
@@ -2201,7 +2297,8 @@ impl PcieDevice {
         let (&cap_start, _) = self
             .find_extended_capability(id)
             .ok_or_else(|| Error::UnsupportedExtendedCap(*id))?;
-        let data_start = cap_start + std::mem::size_of::<u32>(); // Skip the capability header itself
+        // Skip the capability header itself
+        let data_start = cap_start + std::mem::size_of::<u32>();
         let data_end = data_start + len;
         let mut data = Vec::with_capacity(len);
         for offset in data_start..data_end {
@@ -2506,6 +2603,18 @@ impl OutputExt for std::process::Output {
     }
 }
 
+/// Check if a device supports independent error sampler.
+/// This determines whether the device can be margined in parallel with others.
+fn check_independent_error_sampler(
+    device: &PcieDevice,
+    receiver: Receiver,
+) -> Result<bool> {
+    // Use lane 0 to query capabilities
+    let lane = Lane(0);
+    let margin = LaneMargin::new(device.try_clone()?, receiver, lane, 0, false)?;
+    Ok(margin.capabilities().has_independent_error_sampler())
+}
+
 fn margin_one(
     args: &Args,
     dir: &PathBuf,
@@ -2574,7 +2683,14 @@ fn margin_one(
         Port::Downstream => Receiver::downstream(),
     };
 
-    run_margin(dir.to_str(), &node.device, lanes, receiver, args)
+    if args.serial_lanes {
+        for lane in lanes {
+            run_margin(dir.to_str(), &node.device, vec![lane], receiver, args)?;
+        }
+        Ok(())
+    } else {
+        run_margin(dir.to_str(), &node.device, lanes, receiver, args)
+    }
 }
 
 fn zip_dir(src_dir: &Path, dst_file: &Path) -> anyhow::Result<()> {
@@ -2646,24 +2762,79 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
         // Parallel scan (default)
         let mut failed = false;
 
-        let mut bridge_devices = Vec::new();
-        let mut child_devices = Vec::new();
+        // Categorise devices based on independent error sampler support.
+        // Devices with independent error sampler can be margined in parallel.
+        // Devices without must be margined serially.
+        let mut independent_devices = Vec::new();
+        let mut dependent_devices = Vec::new();
 
         for b in bridges.into_iter() {
-            // bridge (downstream)
-             bridge_devices.push(b.bridge);
-            // children (upstream)
+            if args.bridges && b.bridge.margin {
+                // Check bridge (downstream)
+                match check_independent_error_sampler(
+                    &b.bridge.device,
+                    Receiver::downstream(),
+                ) {
+                    Ok(true) => {
+                        independent_devices.push((b.bridge, Port::Downstream));
+                    }
+                    Ok(false) => {
+                        dependent_devices.push((b.bridge, Port::Downstream));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "lmar: failed to check capabilities for {}: {e}",
+                            b.bridge.device.bdf
+                        );
+                        failed = true;
+                    }
+                }
+            }
+
+            // Check children (upstream)
+            if !args.children {
+                continue;
+            }
             for c in b.children.into_iter() {
-                child_devices.push(c);
+                if !c.margin {
+                    continue;
+                }
+                match check_independent_error_sampler(
+                    &c.device,
+                    Receiver::upstream(),
+                ) {
+                    Ok(true) => {
+                        independent_devices.push((c, Port::Upstream));
+                    }
+                    Ok(false) => {
+                        dependent_devices.push((c, Port::Upstream));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "lmar: failed to check capabilities for {}: {e}",
+                            c.device.bdf
+                        );
+                        failed = true;
+                    }
+                }
             }
         }
 
+        if failed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "failed to check device capabilities",
+            )
+            .into());
+        }
+
+        // Margin all independent devices in parallel.
         let mut handles = Vec::new();
-        for b in bridge_devices {
+        for (node, port) in independent_devices {
             let args_ = args.clone();
             let dir_ = dir.clone();
             handles.push(std::thread::spawn(move || {
-                margin_one(&args_, &dir_, b, Port::Downstream)
+                margin_one(&args_, &dir_, node, port)
             }));
         }
 
@@ -2683,26 +2854,38 @@ fn margin_all(args: Args, bridges: Vec<PcieBridge>) -> Result<()> {
             }
         }
 
-        let mut handles = Vec::new();
-        for c in child_devices {
-            let args_ = args.clone();
-            let dir_ = dir.clone();
-            handles.push(std::thread::spawn(move || {
-                margin_one(&args_, &dir_, c, Port::Upstream)
-            }));
-        }
+        if args.force_parallel {
+            // Margin dependent devices in parallel - not compliant with the
+            // specification.
+            handles = Vec::new();
+            for (node, port) in dependent_devices {
+                let args_ = args.clone();
+                let dir_ = dir.clone();
+                handles.push(std::thread::spawn(move || {
+                    margin_one(&args_, &dir_, node, port)
+                }));
+            }
 
-        // Collect results.
-        for h in handles {
-            match h.join() {
-                Ok(res) => {
-                    if let Err(e) = res {
-                        eprintln!("lmar: margining a port failed: {e}");
+            // Collect results.
+            for h in handles {
+                match h.join() {
+                    Ok(res) => {
+                        if let Err(e) = res {
+                            eprintln!("lmar: margining a port failed: {e}");
+                            failed = true;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("lmar: margin thread panicked: {e:?}");
                         failed = true;
                     }
                 }
-                Err(e) => {
-                    eprintln!("lmar: margin thread panicked: {e:?}");
+            }
+        } else {
+            // Margin dependent devices serially (one at a time).
+            for (node, port) in dependent_devices {
+                if let Err(e) = margin_one(&args, &dir, node, port) {
+                    eprintln!("lmar: margining a port failed: {e}");
                     failed = true;
                 }
             }
@@ -2794,7 +2977,13 @@ fn main() -> anyhow::Result<()> {
         format!("margin-{}", chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S"));
     fs::create_dir(&dirname).context("Failed to create output directory")?;
 
-    run_margin(Some(&dirname), &device, lanes, receiver, &args)?;
+    if args.serial_lanes {
+        for lane in lanes {
+            run_margin(Some(&dirname), &device, vec![lane], receiver, &args)?;
+        }
+    } else {
+        run_margin(Some(&dirname), &device, lanes, receiver, &args)?;
+    }
 
     if args.zip {
         let dir = std::path::Path::new(&dirname);
@@ -2845,7 +3034,7 @@ fn run_margin(
         let tx_ = tx.clone();
 
         // Construct object for running the margining protocol.
-        let margin = LaneMargin::new(device_, receiver, lane, args.verbose)
+        let margin = LaneMargin::new(device_, receiver, lane, args.verbose, args.retry_point)
             .context("Could not initialize lane margining")?;
 
         // All margining threads will send us this report of
@@ -2857,9 +3046,26 @@ fn run_margin(
             let capabilities = margin.capabilities();
             println!("lmar: {capabilities:#?}");
             println!("lmar: {limits:#?}");
-            printed_caps = true;
         }
         margining_limits.replace(limits.clone());
+
+        if !printed_caps
+            && (args.verbose >= verbosity::CAPABILITIES || args.report_only)
+        {
+            println!(
+                "Timing: steps={} offset={} step={}%",
+                f64::from(limits.num_timing_steps),
+                f64::from(limits.max_timing_offset),
+                limits.timing_resolution()
+            );
+            println!(
+                "Voltage: steps={} offset={} step={}V",
+                f64::from(limits.num_voltage_steps.unwrap()),
+                f64::from(limits.max_voltage_offset.unwrap()),
+                limits.voltage_resolution()
+            );
+        }
+        printed_caps = true;
 
         // If we're just reporting the capabilities and limits of the device, we
         // do not need to do anything else at all. We've printed them, and
@@ -2915,7 +3121,16 @@ fn run_margin(
         };
 
         // Store the state for this lane's margin worker.
-        state.insert(lane, MarginState { thr, file, n_points: (0, 0), bars });
+        state.insert(
+            lane,
+            MarginState {
+                thr,
+                file,
+                n_points: (0, 0),
+                bars,
+                updates: Vec::new(),
+            },
+        );
     }
 
     // Unhide the progress bars, and tick them all manually so that they draw to
@@ -2962,25 +3177,15 @@ fn run_margin(
                 )
             };
 
-        // Write the result to the output file.
-        let (pass, count) = match update.result {
-            MarginResult::Success(count) => (1, u8::from(count)),
-            MarginResult::Failed(count) => (0, u8::from(count)),
-        };
-        writeln!(
-            st.file,
-            "{:0.3}\t{:0.3}\t{:0.9}\t{}\t{}",
-            update.point.time(),
-            update.point.voltage(),
-            update.duration.as_secs_f64(),
-            count,
-            pass,
-        )
-        .unwrap();
+        // Accumulate the update for later sorting and writing.
+        st.updates.push(update);
 
         // Print the progress to the screen, if needed.
         if args.verbose > verbosity::PROGRESS_SUMMARY {
-            println!("lmar: margined point {n_points} / {n_total_points}: {update:?}");
+            println!(
+                "lmar: margined point {n_points} / {n_total_points}: \
+                 {update:?}"
+            );
         } else if args.verbose == verbosity::PROGRESS_SUMMARY {
             let st = state.get_mut(&update.lane).unwrap();
             let bars = st.bars.as_ref().expect("No progress bars!");
@@ -3006,6 +3211,43 @@ fn run_margin(
             }
         }
     }
+
+    // Sort accumulated updates and write them to files.
+    for st in state.values_mut() {
+        // Sort so that time records (voltage=0) come first sorted by time,
+        // then voltage records (time=0) sorted by voltage.
+        st.updates.sort_by(|a, b| {
+            let a_is_voltage = a.point.voltage() != 0.0;
+            let b_is_voltage = b.point.voltage() != 0.0;
+
+            a_is_voltage.cmp(&b_is_voltage).then_with(|| {
+                if a_is_voltage {
+                    a.point.voltage().partial_cmp(&b.point.voltage()).unwrap()
+                } else {
+                    a.point.time().partial_cmp(&b.point.time()).unwrap()
+                }
+            })
+        });
+
+        // Write all sorted results to the output file.
+        for update in &st.updates {
+            let (pass, count) = match update.result {
+                MarginResult::Success(count) => (1, u8::from(count)),
+                MarginResult::Failed(count) => (0, u8::from(count)),
+            };
+            writeln!(
+                st.file,
+                "{:0.3}\t{:0.3}\t{:0.9}\t{}\t{}",
+                update.point.time(),
+                update.point.voltage(),
+                update.duration.as_secs_f64(),
+                count,
+                pass,
+            )
+            .unwrap();
+        }
+    }
+
     // Print any error messages the threads hit.
     for (lane, state) in state.into_iter() {
         match state.thr.join() {
@@ -3033,6 +3275,8 @@ struct MarginState {
     n_points: (u8, u8),
     // The progress bars, if the summary verbosity level was chosen.
     bars: Option<ProgressBars>,
+    // Accumulated updates to be sorted and written at the end.
+    updates: Vec<MarginUpdate>,
 }
 
 // The progress bars for a single lane.
@@ -3075,7 +3319,7 @@ impl ProgressBars {
 }
 
 // An update from a thread about margining a single point.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct MarginUpdate {
     // The lane being margined.
     lane: Lane,
@@ -3087,10 +3331,15 @@ struct MarginUpdate {
     result: MarginResult,
 }
 
+// Number of consecutive failures needed to trigger early stopping.
+// Once this many consecutive failures are seen in a direction, remaining
+// points in that direction are skipped and synthesized as failures.
+const CONSECUTIVE_FAILURES_THRESHOLD: u8 = 2;
+
 fn margin_lane(
     margin: LaneMargin,
     duration: Duration,
-    error_count: Option<u8>,
+    error_count: u8,
     timing: bool,
     voltage: bool,
     tx: mpsc::Sender<MarginUpdate>,
@@ -3098,34 +3347,33 @@ fn margin_lane(
     let lane = margin.lane();
     let capabilities = margin.capabilities();
     let limits = margin.limits();
-    if let Some(_count) = error_count {
-        /*
-        margin.set_error_count_limit(4).unwrap();
-        */
+
+    if margin.supports_error_count_limit() {
+        margin.set_error_count_limit(error_count).unwrap();
     }
 
     // Compute the resolution in both dimensions.
-    let timing_resolution: f64 = f64::from(limits.max_timing_offset)
-        / f64::from(limits.num_timing_steps);
-    let voltage_resolution: f64 = if capabilities.voltage_supported {
-        (f64::from(limits.max_voltage_offset.unwrap())
-            / f64::from(limits.num_voltage_steps.unwrap()))
-            / 100.0
-    } else {
-        0.0
-    };
+    let timing_resolution = limits.timing_resolution();
+    let voltage_resolution = limits.voltage_resolution();
 
-    // Iterate over the timing steps from left to right.
     if timing {
+        // Iterate over the timing steps from center to left and then
+        // center to right.
         let steps = margin.iter_left_right_steps();
-        for step in steps.into_iter() {
-            // Set up per the spec for margining a single point.
-            margin.clear_error_log()?;
-            margin.go_to_normal_settings()?;
-            margin.no_command()?;
+        let mut consecutive_failures: u8 = 0;
+        let mut current_direction: Option<LeftRight> = None;
+        let mut should_skip_remaining = false;
 
-            // Compute the actual time as a percentage of UI that we're currently
-            // margining.
+        for step in steps.into_iter() {
+            // Reset tracking when direction changes.
+            if current_direction != step.direction {
+                consecutive_failures = 0;
+                current_direction = step.direction;
+                should_skip_remaining = false;
+            }
+
+            // Compute the actual time as a percentage of UI that we're
+            // currently margining.
             let sign = if matches!(step.direction, Some(LeftRight::Left)) {
                 -1.0
             } else {
@@ -3134,26 +3382,59 @@ fn margin_lane(
             let point = MarginPoint::Time(
                 sign * timing_resolution * f64::from(step.steps.0),
             );
-            let (margin_duration, result) = margin
-                .margin_at_left_right(step, duration)
-                .context(format!("Failed to margin point: {step:?}"))?;
+
+            let (margin_duration, result) = if should_skip_remaining {
+                // Skip the actual margin and synthesize a failure.
+                (
+                    Duration::from_secs(0),
+                    MarginResult::Failed(ErrorCount::from(63)),
+                )
+            } else {
+                // Set up per the spec for margining a single point.
+                margin.clear_error_log()?;
+                margin.go_to_normal_settings()?;
+                margin.no_command()?;
+
+                margin
+                    .margin_at_left_right(step, duration)
+                    .context(format!("Failed to margin point: {step:?}"))?
+            };
+
             tx.send(MarginUpdate {
                 lane,
                 point,
                 duration: margin_duration,
                 result,
             })?;
+
+            // Update consecutive failure tracking for early stopping.
+            if !should_skip_remaining {
+                if matches!(result, MarginResult::Failed(_)) {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD {
+                        should_skip_remaining = true;
+                    }
+                } else {
+                    consecutive_failures = 0;
+                }
+            }
         }
     }
 
     // Iterate over the voltage steps, if supported.
-    if voltage {
+    if voltage && capabilities.voltage_supported {
         let steps = margin.iter_up_down_steps();
+        let mut consecutive_failures: u8 = 0;
+        let mut current_direction: Option<UpDown> = None;
+        let mut should_skip_remaining = false;
+
         for step in steps.into_iter() {
-            // Set up per the spec for margining a single point.
-            margin.clear_error_log()?;
-            margin.go_to_normal_settings()?;
-            margin.no_command()?;
+            // Reset tracking when direction changes.
+            if current_direction != step.direction {
+                consecutive_failures = 0;
+                current_direction = step.direction;
+                should_skip_remaining = false;
+            }
 
             // Compute the actual voltage at which we're margining.
             let sign = if matches!(step.direction, Some(UpDown::Down)) {
@@ -3164,15 +3445,42 @@ fn margin_lane(
             let point = MarginPoint::Voltage(
                 sign * voltage_resolution * f64::from(step.steps.0),
             );
-            let (margin_duration, result) = margin
-                .margin_at_up_down(step, duration)
-                .context(format!("Failed to margin point: {step:?}"))?;
+
+            let (margin_duration, result) = if should_skip_remaining {
+                // Skip the actual margin and synthesize a failure.
+                (
+                    Duration::from_secs(0),
+                    MarginResult::Failed(ErrorCount::from(63)),
+                )
+            } else {
+                // Set up per the spec for margining a single point.
+                margin.clear_error_log()?;
+                margin.go_to_normal_settings()?;
+                margin.no_command()?;
+
+                margin
+                    .margin_at_up_down(step, duration)
+                    .context(format!("Failed to margin point: {step:?}"))?
+            };
+
             tx.send(MarginUpdate {
                 lane,
                 point,
                 duration: margin_duration,
                 result,
             })?;
+
+            // Update consecutive failure tracking for early stopping.
+            if !should_skip_remaining {
+                if matches!(result, MarginResult::Failed(_)) {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= CONSECUTIVE_FAILURES_THRESHOLD {
+                        should_skip_remaining = true;
+                    }
+                } else {
+                    consecutive_failures = 0;
+                }
+            }
         }
     }
 
@@ -3182,7 +3490,7 @@ fn margin_lane(
 fn four_point(
     margin: LaneMargin,
     duration: Duration,
-    error_count: Option<u8>,
+    error_count: u8,
     timing: bool,
     voltage: bool,
     tx: mpsc::Sender<MarginUpdate>,
@@ -3190,6 +3498,22 @@ fn four_point(
     let lane = margin.lane();
     let capabilities = margin.capabilities();
     let limits = margin.limits();
+
+    if margin.supports_error_count_limit() {
+        margin.set_error_count_limit(error_count).unwrap();
+    } else {
+        let reason = if capabilities.is_rate_based() {
+            "uses rate-based sampling (not count-based)"
+        } else {
+            "does not support independent error sampler"
+        };
+        eprintln!(
+            "Warning: Lane {} does not support custom error count \
+             limits ({}), using device default",
+            u8::from(lane),
+            reason
+        );
+    }
 
     // Compute the resolution in both dimensions.
     let timing_resolution: f64 = f64::from(limits.max_timing_offset)
@@ -3221,7 +3545,6 @@ fn four_point(
             margin.clear_error_log()?;
             margin.go_to_normal_settings()?;
             margin.no_command()?;
-            //margin.set_error_count_limit(error_count.unwrap_or(5)).unwrap();
 
             let sign = if matches!(step.direction, Some(LeftRight::Left)) {
                 -1.0
@@ -3261,7 +3584,6 @@ fn four_point(
             margin.clear_error_log()?;
             margin.go_to_normal_settings()?;
             margin.no_command()?;
-            //margin.set_error_count_limit(error_count.unwrap_or(5)).unwrap();
 
             // Compute the actual voltage at which we're margining.
             let sign = if matches!(step.direction, Some(UpDown::Down)) {
