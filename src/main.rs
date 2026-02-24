@@ -1651,11 +1651,18 @@ impl LaneMarginInner {
                     }
 
                     // Recover + retry.
+                    eprintln!(
+                        "lmar: retrying lane {} (bdf {}) after error: {}",
+                        self.lane, self.device.bdf, msg
+                    );
                     let _ = self.no_command();
+                    sleep(Duration::from_millis(20));
                     let _ = self.clear_error_log();
+                    sleep(Duration::from_millis(20));
                     let _ = self.no_command();
+                    sleep(Duration::from_millis(20));
                     let _ = self.go_to_normal_settings();
-                    sleep(Duration::from_millis(50));
+                    sleep(Duration::from_millis(500));
                 }
             }
         }
@@ -1863,6 +1870,10 @@ impl LaneMargin {
 
     pub fn lane(&self) -> Lane {
         self.inner.lane
+    }
+
+    pub fn bdf(&self) -> &Bdf {
+        &self.inner.device.bdf
     }
 
     pub fn receiver(&self) -> Receiver {
@@ -3292,10 +3303,10 @@ fn run_margin(
         match state.thr.join() {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                eprintln!("lmar: margining lane {lane} failed: {e:#}");
+                eprintln!("lmar: margining lane {lane} (bdf {}) failed: {e:#}", device.bdf);
             }
             Err(e) => {
-                eprintln!("lmar: margining lane {lane} panicked: {e:?}");
+                eprintln!("lmar: margining lane {lane} (bdf {}) panicked: {e:?}", device.bdf);
             }
         }
     }
@@ -3453,6 +3464,7 @@ fn margin_lane(
     tx: mpsc::Sender<MarginUpdate>,
 ) -> anyhow::Result<()> {
     let lane = margin.lane();
+    let bdf = margin.bdf();
     let capabilities = margin.capabilities();
     let limits = margin.limits();
 
@@ -3480,9 +3492,14 @@ fn margin_lane(
     }
 
     // Probe a point once (includes the standard setup sequence).
+    // The 20ms sleep between clear_error_log and go_to_normal_settings avoids
+    // a stale-echo problem on some bridge devices where the response register
+    // still reflects the ClearErrorLog echo when GoToNormalSettings is read.
     let probe_left_right_once = |step: StepLeftRight| -> anyhow::Result<(Duration, MarginResult)> {
         margin.clear_error_log()?;
+        sleep(Duration::from_millis(20));
         margin.go_to_normal_settings()?;
+        sleep(Duration::from_millis(20));
         margin.no_command()?;
         let (d, r) = margin
             .margin_at_left_right(step, duration)
@@ -3492,7 +3509,9 @@ fn margin_lane(
 
     let probe_up_down_once = |step: StepUpDown| -> anyhow::Result<(Duration, MarginResult)> {
         margin.clear_error_log()?;
+        sleep(Duration::from_millis(20));
         margin.go_to_normal_settings()?;
+        sleep(Duration::from_millis(20));
         margin.no_command()?;
         let (d, r) = margin
             .margin_at_up_down(step, duration)
@@ -3812,11 +3831,35 @@ fn margin_lane(
                 Ok(())
             };
 
-            // Run directions that are actually supported by the device behavior.
-            // (Matches the legacy step generation shape.)
-            find_edge_for_dir(LeftRight::Right)?;
+            // Run directions with per-direction retry on intermittent setup
+            // timeouts.  Each direction gets up to MAX_DIR_RETRIES additional
+            // attempts (with a 1s recovery sleep) before the lane is abandoned.
+            const MAX_DIR_RETRIES: usize = 4;
+            let mut dirs_lr = vec![LeftRight::Right];
             if margin.capabilities().independent_left_right_sampling {
-                find_edge_for_dir(LeftRight::Left)?;
+                dirs_lr.push(LeftRight::Left);
+            }
+            for dir in dirs_lr {
+                for attempt in 0..=MAX_DIR_RETRIES {
+                    match find_edge_for_dir(dir) {
+                        Ok(()) => break,
+                        Err(e) if attempt < MAX_DIR_RETRIES => {
+                            eprintln!(
+                                "lmar: timing {:?} edge search failed \
+                                 (attempt {}/{}) lane {} (bdf {}), \
+                                 retrying in 1s: {}",
+                                dir,
+                                attempt + 1,
+                                MAX_DIR_RETRIES + 1,
+                                lane,
+                                bdf,
+                                e
+                            );
+                            sleep(Duration::from_secs(1));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             }
 
             // Emit dense updates in canonical order (legacy order).
@@ -4148,9 +4191,33 @@ fn margin_lane(
             };
 
             // Match legacy shape: Up always; Down only if independent.
-            find_edge_for_dir(UpDown::Up)?;
+            // Per-direction retry on intermittent setup timeouts.
+            const MAX_DIR_RETRIES: usize = 4;
+            let mut dirs_ud = vec![UpDown::Up];
             if margin.capabilities().independent_up_down_voltage {
-                find_edge_for_dir(UpDown::Down)?;
+                dirs_ud.push(UpDown::Down);
+            }
+            for dir in dirs_ud {
+                for attempt in 0..=MAX_DIR_RETRIES {
+                    match find_edge_for_dir(dir) {
+                        Ok(()) => break,
+                        Err(e) if attempt < MAX_DIR_RETRIES => {
+                            eprintln!(
+                                "lmar: voltage {:?} edge search failed \
+                                 (attempt {}/{}) lane {} (bdf {}), \
+                                 retrying in 1s: {}",
+                                dir,
+                                attempt + 1,
+                                MAX_DIR_RETRIES + 1,
+                                lane,
+                                bdf,
+                                e
+                            );
+                            sleep(Duration::from_secs(1));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             }
 
             // Emit dense updates in canonical legacy order.
