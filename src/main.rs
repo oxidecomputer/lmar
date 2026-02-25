@@ -271,6 +271,17 @@ pub enum Error {
     Margin(String),
 
     #[error(
+        "Lane margin setup did not complete within {duration:?} \
+         (polls={polls}, last_error_count={last_error_count:?}, cmd={cmd:?})"
+    )]
+    SetupTimeout {
+        duration: Duration,
+        polls: u32,
+        last_error_count: Option<ErrorCount>,
+        cmd: MarginCommand,
+    },
+
+    #[error(
         "Failed to decode response for command {command:?}, reason {reason}"
     )]
     DecodeFailed { command: MarginCommand, reason: String },
@@ -740,6 +751,13 @@ impl MarginCommand {
             (
                 MarginCommand::GoToNormalSettings,
                 MarginResponse::GoToNormalSettings,
+            ) => true,
+            // Some devices process GoToNormalSettings so quickly that the echo
+            // is gone before our first poll (100µs later).  If we see NoCommand
+            // it means the device already completed the reset -- treat as success.
+            (
+                MarginCommand::GoToNormalSettings,
+                MarginResponse::NoCommand,
             ) => true,
             (MarginCommand::ClearErrorLog, MarginResponse::ClearErrorLog) => {
                 true
@@ -1328,6 +1346,16 @@ struct LaneMarginInner {
     retry_point: bool,
 }
 
+impl Drop for LaneMarginInner {
+    fn drop(&mut self) {
+        // Best-effort cleanup: return the device to a known idle state
+        // whenever the margining session ends, whether normally, on error,
+        // or on panic.  Errors are ignored since we can't propagate them.
+        let _ = self.go_to_normal_settings();
+        let _ = self.no_command();
+    }
+}
+
 impl LaneMarginInner {
     fn report(&self, request: ReportRequest) -> Result<ReportResponse, Error> {
         let cmd = MarginCommand::Report(request);
@@ -1382,7 +1410,10 @@ impl LaneMarginInner {
         let cmd = MarginCommand::GoToNormalSettings;
         self.write_command(cmd)?;
         match self.wait_for_response(cmd)? {
-            MarginResponse::GoToNormalSettings => Ok(()),
+            // Normal case: device echoes the command back.
+            // Fast case: device processed it before our first poll and is
+            // already back to NoCommand -- treat as success.
+            MarginResponse::GoToNormalSettings | MarginResponse::NoCommand => Ok(()),
             other => Err(Error::Margin(format!(
                 "Margining failed, expected Go To Normal Settings \
                  response, found: {:?}",
@@ -1640,11 +1671,8 @@ impl LaneMarginInner {
             match self.margin_at_once(cmd, duration) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    let msg = e.to_string();
-                    let is_setup_timeout =
-                        msg.contains("Failed to finish margin setup within");
-                    let should_retry =
-                        is_setup_timeout || self.retry_point;
+                    let is_setup_timeout = matches!(e, Error::SetupTimeout { .. });
+                    let should_retry = is_setup_timeout || self.retry_point;
 
                     if !should_retry || attempt == 1 {
                         return Err(e);
@@ -1653,7 +1681,7 @@ impl LaneMarginInner {
                     // Recover + retry.
                     eprintln!(
                         "lmar: retrying lane {} (bdf {}) after error: {}",
-                        self.lane, self.device.bdf, msg
+                        self.lane, self.device.bdf, e
                     );
                     let _ = self.no_command();
                     sleep(Duration::from_millis(20));
@@ -1676,15 +1704,19 @@ impl LaneMarginInner {
     ) -> Result<(Duration, MarginResult), Error> {
         self.write_command(cmd)?;
 
-        // Interval between checks when execution status is "setup"
-        const INTERVAL: Duration = Duration::from_millis(1);
+        // Interval between checks when execution status is "setup".
+        // 20ms gives the device ~19ms of quiet time between config-space
+        // reads; frequent polling may interfere with the device's internal
+        // voltage-DAC state machine on some hardware.
+        const INTERVAL: Duration = Duration::from_millis(20);
 
-        // Total duration before setup must complete
-        const TOTAL_DURATION: Duration = Duration::from_millis(2000);
+        // Total duration before setup must complete.
+        // 5s: some devices at extreme voltage steps take longer than 2s to
+        // transition from Setup to InProgress.
+        const TOTAL_DURATION: Duration = Duration::from_millis(5000);
 
         // counters for NaN error info
         let mut setup_polls: u32 = 0;
-        let mut _last_error_count: Option<ErrorCount> = None;
         let now = Instant::now();
         loop {
             let response = self.wait_for_response(cmd)?;
@@ -1699,18 +1731,14 @@ impl LaneMarginInner {
 
                         StepMarginExecutionStatus::Setup => {
                             setup_polls += 1;
-                            _last_error_count = Some(error_count);
 
                             if now.elapsed() > TOTAL_DURATION {
-                                return Err(Error::Margin(format!(
-                                    "Failed to finish margin setup within \
-                                     {:?} (polls={}, last_error_count={:?}, \
-                                     cmd={:?})",
-                                    TOTAL_DURATION,
-                                    setup_polls,
-                                    _last_error_count,
+                                return Err(Error::SetupTimeout {
+                                    duration: TOTAL_DURATION,
+                                    polls: setup_polls,
+                                    last_error_count: Some(error_count),
                                     cmd,
-                                )));
+                                });
                             }
                             sleep(INTERVAL);
                             continue;
@@ -1850,6 +1878,14 @@ impl LaneMargin {
             verbosity,
             retry_point: retry,
         };
+        // Reset device state before reading capabilities -- a previous run
+        // may have left the device stuck in a margining state (e.g. Setup
+        // phase of a StepUpDown command that never completed).
+        let _ = inner.go_to_normal_settings();
+        sleep(Duration::from_millis(100));
+        let _ = inner.no_command();
+        sleep(Duration::from_millis(20));
+
         let capabilities = inner.report_capabilities()?;
         inner.no_command()?;
         let limits = inner.gather_limits(&capabilities)?;
@@ -3468,6 +3504,25 @@ fn margin_lane(
     let capabilities = margin.capabilities();
     let limits = margin.limits();
 
+    // Reset the lane margining state machine to a known-good state before
+    // starting.  If a previous run was killed mid-sweep (SIGKILL, panic, etc.)
+    // the device may be stuck in Setup, InProgress, or ExcessiveError.
+    //
+    // NoCommand is required by the PCIe spec to be accepted from any state.
+    // GoToNormalSettings restores all DAC/CDR offsets to factory defaults.
+    // Errors are intentionally ignored -- the device may be unresponsive at
+    // this point; if so, the first real probe will surface the failure.
+    let _ = margin.no_command();
+    sleep(Duration::from_millis(50));
+    let _ = margin.clear_error_log();
+    sleep(Duration::from_millis(50));
+    let _ = margin.no_command();
+    sleep(Duration::from_millis(50));
+    let _ = margin.go_to_normal_settings();
+    sleep(Duration::from_millis(50));
+    let _ = margin.no_command();
+    sleep(Duration::from_millis(50));
+
     if margin.supports_error_count_limit() {
         margin.set_error_count_limit(error_count).unwrap();
     }
@@ -3498,6 +3553,8 @@ fn margin_lane(
     let probe_left_right_once = |step: StepLeftRight| -> anyhow::Result<(Duration, MarginResult)> {
         margin.clear_error_log()?;
         sleep(Duration::from_millis(20));
+        margin.no_command()?;
+        sleep(Duration::from_millis(20));
         margin.go_to_normal_settings()?;
         sleep(Duration::from_millis(20));
         margin.no_command()?;
@@ -3510,13 +3567,24 @@ fn margin_lane(
     let probe_up_down_once = |step: StepUpDown| -> anyhow::Result<(Duration, MarginResult)> {
         margin.clear_error_log()?;
         sleep(Duration::from_millis(20));
+        margin.no_command()?;
+        sleep(Duration::from_millis(20));
         margin.go_to_normal_settings()?;
         sleep(Duration::from_millis(20));
         margin.no_command()?;
-        let (d, r) = margin
-            .margin_at_up_down(step, duration)
-            .context(format!("Failed to margin point: {step:?}"))?;
-        Ok((d, r))
+        match margin.margin_at_up_down(step, duration) {
+            Ok((d, r)) => Ok((d, r)),
+            // A persistent setup timeout means the device cannot execute this
+            // voltage step (e.g. extreme DAC range).  Treat it as a hard fail
+            // so the edge-search algorithm records the boundary correctly
+            // instead of erroring out the direction and producing a false
+            // all-pass eye.
+            Err(Error::SetupTimeout { .. }) => {
+                Ok((Duration::from_secs(0), MarginResult::Failed(ErrorCount::from(63))))
+            }
+            Err(e) => Err(anyhow::Error::from(e)
+                .context(format!("Failed to margin point: {step:?}"))),
+        }
     };
 
     // For "0-candidate" probes only: if pass but nonzero, re-probe once and
@@ -3727,8 +3795,24 @@ fn margin_lane(
                         first_fail_by_dir.insert(dir, Some(1));
                         return Ok(());
                     }
-                    // No failure found (all steps pass), or other degenerate
-                    // case: synthesize all as Success(0).
+                    // No failure found: device passes at all timing steps.
+                    // Probe the EDGE_ZERO_TARGET steps just inside max_step so
+                    // the emitter shows measured (not synthesized) data near the
+                    // boundary -- the outward search jumps geometrically and
+                    // may have skipped those adjacent steps entirely.
+                    (Some(_), None) => {
+                        for offset in 1..=EDGE_ZERO_TARGET {
+                            let s_conf = max_step.saturating_sub(offset);
+                            if s_conf >= 1 {
+                                let _ = probe_lr_cached(
+                                    &mut measured, dir, s_conf, true,
+                                );
+                            }
+                        }
+                        first_fail_by_dir.insert(dir, None);
+                        return Ok(());
+                    }
+                    // Degenerate case: synthesize all as Success(0).
                     _ => {
                         first_fail_by_dir.insert(dir, None);
                         return Ok(());
@@ -3771,9 +3855,6 @@ fn margin_lane(
                         s = next;
                         delta = delta.saturating_add(1);
                     }
-                    if s == hi {
-                        break;
-                    }
                 }
 
                 // Linear finish to the exact minimal failing step (bracket is small here).
@@ -3792,22 +3873,25 @@ fn margin_lane(
 
 
                 // Edge confirmation:
-                // Always measure hi-1. Then hunt inward for EDGE_ZERO_TARGET 0-error points
-                // (or stop early on a fail). NOTE: 1 is likely enough; try EDGE_ZERO_TARGET=1.
+                // Always measure hi-1 (the candidate, immediately inside the fail).
+                // Then hunt inward for EDGE_ZERO_TARGET 0-error confirmation points
+                // (backoffs).
+                //
+                // If hi-1 is itself zero it becomes the candidate; otherwise the
+                // first zero found in the inward hunt is the candidate.  The
+                // candidate is NOT counted toward EDGE_ZERO_TARGET so we always
+                // collect exactly EDGE_ZERO_TARGET backoffs beyond it.
                 let prev = hi.saturating_sub(1);
                 if prev >= 1 {
-                    let mut zeros_found: u8 = 0;
-
                     let (_, r_prev) = probe_lr_cached(&mut measured, dir, prev, false)?;
-                    if is_zero(&r_prev) {
-                        zeros_found = zeros_found.saturating_add(1);
-                    }
 
-                    // Only spend extra probes if we still want more 0-error points.
-                    if zeros_found < EDGE_ZERO_TARGET && !is_fail(&r_prev) {
+                    if !is_fail(&r_prev) {
+                        // candidate_found: true once we have probed one zero-error
+                        // point; subsequent zeros count as backoffs.
+                        let mut candidate_found = is_zero(&r_prev);
+                        let mut zeros_found: u8 = 0;
                         let mut inward = prev;
                         let mut extra_probes = 0u8;
-                        // Keep small; EDGE_ZERO_TARGET=1 may be enough and faster.
                         const MAX_EXTRA_INWARD_PROBES: u8 = 4;
 
                         while inward > 1
@@ -3819,7 +3903,11 @@ fn margin_lane(
 
                             let (_, r_in) = probe_lr_cached(&mut measured, dir, inward, true)?;
                             if is_zero(&r_in) {
-                                zeros_found = zeros_found.saturating_add(1);
+                                if candidate_found {
+                                    zeros_found = zeros_found.saturating_add(1);
+                                } else {
+                                    candidate_found = true;
+                                }
                             }
                             if is_fail(&r_in) {
                                 break;
@@ -3839,6 +3927,8 @@ fn margin_lane(
             if margin.capabilities().independent_left_right_sampling {
                 dirs_lr.push(LeftRight::Left);
             }
+            let mut timing_err: Option<anyhow::Error> = None;
+            let mut timing_failed_dirs: Vec<LeftRight> = Vec::new();
             for dir in dirs_lr {
                 for attempt in 0..=MAX_DIR_RETRIES {
                     match find_edge_for_dir(dir) {
@@ -3857,9 +3947,22 @@ fn margin_lane(
                             );
                             sleep(Duration::from_secs(1));
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            // Record error but don't return yet -- let the
+                            // emitter run so partial timing data is written.
+                            timing_failed_dirs.push(dir);
+                            timing_err = Some(e);
+                            break;
+                        }
                     }
                 }
+            }
+            // Release the closure's mutable borrow of first_fail_by_dir, then
+            // mark each failed direction as all-failed so the emitter doesn't
+            // synthesize a false all-pass for directions we couldn't measure.
+            drop(find_edge_for_dir);
+            for dir in timing_failed_dirs {
+                first_fail_by_dir.entry(dir).or_insert(Some(1));
             }
 
             // Emit dense updates in canonical order (legacy order).
@@ -3915,6 +4018,10 @@ fn margin_lane(
                     result: r,
                 })?;
             }
+            // Emit whatever timing data we collected, then surface any error.
+            if let Some(e) = timing_err {
+                return Err(e);
+            }
         }
     }
     // Iterate over the voltage steps, if supported.
@@ -3952,9 +4059,19 @@ fn margin_lane(
                     margin.go_to_normal_settings()?;
                     margin.no_command()?;
 
-                    margin
-                        .margin_at_up_down(step, duration)
-                        .context(format!("Failed to margin point: {step:?}"))?
+                    match margin.margin_at_up_down(step, duration) {
+                        Ok(v) => v,
+                        // A persistent setup timeout means the device cannot
+                        // execute this voltage step.  Treat it as a hard fail
+                        // so the sweep emits a correct Failed point and the
+                        // consecutive-failure logic can cleanly skip remaining
+                        // steps, rather than erroring out the whole lane.
+                        Err(Error::SetupTimeout { .. }) => {
+                            (Duration::from_secs(0), MarginResult::Failed(ErrorCount::from(63)))
+                        }
+                        Err(e) => return Err(anyhow::Error::from(e)
+                            .context(format!("Failed to margin point: {step:?}"))),
+                    }
                 };
 
                 tx.send(MarginUpdate {
@@ -4094,8 +4211,23 @@ fn margin_lane(
                         first_fail_by_dir.insert(dir, Some(start));
                         return Ok(());
                     }
-                    // No failure found (all steps pass), or other degenerate
-                    // case: synthesize all as Success(0).
+                    // No failure found: device passes at all voltage steps.
+                    // Probe the EDGE_ZERO_TARGET steps just inside end so the
+                    // emitter shows measured (not synthesized) data near the
+                    // boundary -- the outward search may have jumped over them.
+                    (Some(_), None) => {
+                        for offset in 1..=EDGE_ZERO_TARGET {
+                            let s_conf = end.saturating_sub(offset);
+                            if s_conf >= start {
+                                let _ = probe_ud_cached(
+                                    &mut measured, dir, s_conf, true,
+                                );
+                            }
+                        }
+                        first_fail_by_dir.insert(dir, None);
+                        return Ok(());
+                    }
+                    // Degenerate case: synthesize all as Success(0).
                     _ => {
                         first_fail_by_dir.insert(dir, None);
                         return Ok(());
@@ -4134,9 +4266,6 @@ fn margin_lane(
                         s = next;
                         delta = delta.saturating_add(1);
                     }
-                    if s == hi {
-                        break;
-                    }
                 }
 
                 let mut cand = last_pass.saturating_add(1);
@@ -4153,18 +4282,23 @@ fn margin_lane(
 
 
                 // Edge confirmation (voltage):
-                // Always measure hi-1, then hunt inward for EDGE_ZERO_TARGET 0-error points.
-                // NOTE: 1 is likely enough; try EDGE_ZERO_TARGET=1.
+                // Always measure hi-1 (the candidate, immediately inside the fail).
+                // Then hunt inward for EDGE_ZERO_TARGET 0-error confirmation points
+                // (backoffs).
+                //
+                // If hi-1 is itself zero it becomes the candidate; otherwise the
+                // first zero found in the inward hunt is the candidate.  The
+                // candidate is NOT counted toward EDGE_ZERO_TARGET so we always
+                // collect exactly EDGE_ZERO_TARGET backoffs beyond it.
                 let prev = hi.saturating_sub(1);
                 if prev >= start {
-                    let mut zeros_found: u8 = 0;
-
                     let (_, r_prev) = probe_ud_cached(&mut measured, dir, prev, false)?;
-                    if is_zero(&r_prev) {
-                        zeros_found = zeros_found.saturating_add(1);
-                    }
 
-                    if zeros_found < EDGE_ZERO_TARGET && !is_fail(&r_prev) {
+                    if !is_fail(&r_prev) {
+                        // candidate_found: true once we have probed one zero-error
+                        // point; subsequent zeros count as backoffs.
+                        let mut candidate_found = is_zero(&r_prev);
+                        let mut zeros_found: u8 = 0;
                         let mut inward = prev;
                         let mut extra_probes = 0u8;
                         const MAX_EXTRA_INWARD_PROBES: u8 = 4;
@@ -4178,7 +4312,11 @@ fn margin_lane(
 
                             let (_, r_in) = probe_ud_cached(&mut measured, dir, inward, true)?;
                             if is_zero(&r_in) {
-                                zeros_found = zeros_found.saturating_add(1);
+                                if candidate_found {
+                                    zeros_found = zeros_found.saturating_add(1);
+                                } else {
+                                    candidate_found = true;
+                                }
                             }
                             if is_fail(&r_in) {
                                 break;
@@ -4197,6 +4335,8 @@ fn margin_lane(
             if margin.capabilities().independent_up_down_voltage {
                 dirs_ud.push(UpDown::Down);
             }
+            let mut voltage_err: Option<anyhow::Error> = None;
+            let mut voltage_failed_dirs: Vec<UpDown> = Vec::new();
             for dir in dirs_ud {
                 for attempt in 0..=MAX_DIR_RETRIES {
                     match find_edge_for_dir(dir) {
@@ -4215,9 +4355,22 @@ fn margin_lane(
                             );
                             sleep(Duration::from_secs(1));
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            // Record error but don't return yet -- let the
+                            // emitter run so partial voltage data is written.
+                            voltage_failed_dirs.push(dir);
+                            voltage_err = Some(e);
+                            break;
+                        }
                     }
                 }
+            }
+            // Release the closure's mutable borrow of first_fail_by_dir, then
+            // mark each failed direction as all-failed so the emitter doesn't
+            // synthesize a false all-pass for directions we couldn't measure.
+            drop(find_edge_for_dir);
+            for dir in voltage_failed_dirs {
+                first_fail_by_dir.entry(dir).or_insert(Some(start));
             }
 
             // Emit dense updates in canonical legacy order.
@@ -4269,6 +4422,10 @@ fn margin_lane(
                     duration: d,
                     result: r,
                 })?;
+            }
+            // Emit whatever voltage data we collected, then surface any error.
+            if let Some(e) = voltage_err {
+                return Err(e);
             }
         }
     }
